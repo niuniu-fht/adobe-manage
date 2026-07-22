@@ -14,6 +14,7 @@ from .api import api_router, auth_router
 from .config import BASE_DIR, settings
 from .database import SessionLocal, create_schema, migrate_schema
 from .polling import fleet_poller
+from .preferences import seed_manager_settings
 from .remote import remote_client
 
 
@@ -25,6 +26,7 @@ async def lifespan(_app: FastAPI):
         create_schema()
     with SessionLocal() as db:
         seed_alert_rules(db)
+        seed_manager_settings(db)
     fleet_poller.start()
     try:
         yield

@@ -25,8 +25,18 @@ from .models import (
 )
 from .notifications import notification_service
 from .polling import fleet_poller
+from .preferences import get_low_credit_threshold, set_low_credit_threshold
 from .remote import RemoteError, remote_client
-from .schemas import AlertRuleUpdate, InstanceCreate, InstanceUpdate, LoginRequest, SilenceRequest
+from .schemas import (
+    AccountBatchEnabledRequest,
+    AccountBatchRequest,
+    AlertRuleUpdate,
+    InstanceCreate,
+    InstanceUpdate,
+    LoginRequest,
+    ManagerPreferencesUpdate,
+    SilenceRequest,
+)
 from .security import (
     check_login_rate_limit,
     create_session,
@@ -259,6 +269,9 @@ def dashboard(db: Session = Depends(get_db)):
             "offline": sum(1 for item in instances if item.state == "offline"),
             "active_alerts": len(active_alerts),
         },
+        "preferences": {
+            "low_credit_threshold": get_low_credit_threshold(db),
+        },
         "updated_at": time.time(),
     }
 
@@ -431,6 +444,199 @@ def _selected_instances(db: Session, instance_ids: Optional[str]) -> list[Instan
     return list(db.scalars(query).all())
 
 
+ACCOUNT_FIELDS = (
+    "id",
+    "name",
+    "display_name",
+    "email",
+    "user_id",
+    "enabled",
+    "health",
+    "low_credit",
+    "credits_available",
+    "credits_total",
+    "credits_updated_at",
+    "credential_status",
+    "credential_expires_at",
+    "consecutive_failures",
+    "last_attempt_at",
+    "last_success_at",
+    "next_refresh_at",
+    "last_error",
+    "imported_at",
+)
+ACCOUNT_SUMMARY_FIELDS = (
+    "total",
+    "available",
+    "low_credit",
+    "balance_unknown",
+    "refresh_failing",
+    "credential_error",
+    "credits_available",
+    "credits_total",
+    "low_credit_threshold",
+)
+ACCOUNT_HEALTH_VALUES = {
+    "healthy",
+    "low_credit",
+    "balance_unknown",
+    "refresh_failed",
+    "credential_error",
+    "disabled",
+}
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_account(item: Any, instance: Instance) -> Optional[dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    profile_id = str(item.get("id") or "").strip()
+    if not profile_id:
+        return None
+    payload = {field: item.get(field) for field in ACCOUNT_FIELDS}
+    payload["id"] = profile_id
+    payload["name"] = str(payload.get("name") or profile_id)[:200]
+    payload["display_name"] = str(payload.get("display_name") or "")[:300]
+    payload["email"] = str(payload.get("email") or "")[:320]
+    payload["user_id"] = str(payload.get("user_id") or "")[:300]
+    payload["last_error"] = str(payload.get("last_error") or "")[:1000]
+    payload["enabled"] = bool(payload.get("enabled"))
+    payload["low_credit"] = bool(payload.get("low_credit"))
+    health = str(payload.get("health") or "balance_unknown")
+    payload["health"] = health if health in ACCOUNT_HEALTH_VALUES else "balance_unknown"
+    payload["credential_status"] = str(payload.get("credential_status") or "unknown")[:40]
+    for field in (
+        "credits_available",
+        "credits_total",
+        "credits_updated_at",
+        "credential_expires_at",
+        "last_attempt_at",
+        "last_success_at",
+        "next_refresh_at",
+        "imported_at",
+    ):
+        payload[field] = _optional_float(payload.get(field))
+    try:
+        payload["consecutive_failures"] = max(
+            0, int(payload.get("consecutive_failures") or 0)
+        )
+    except (TypeError, ValueError):
+        payload["consecutive_failures"] = 0
+    payload["instance_id"] = instance.id
+    payload["instance_name"] = instance.name
+    payload["duplicate"] = False
+    return payload
+
+
+def _sort_accounts(items: list[dict[str, Any]]) -> None:
+    items.sort(
+        key=lambda item: (
+            item.get("credits_available") is None,
+            float(item.get("credits_available") or 0),
+            str(item.get("instance_name") or "").lower(),
+            str(item.get("name") or "").lower(),
+        )
+    )
+
+
+def _mark_duplicate_accounts(items: list[dict[str, Any]]) -> None:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        user_id = str(item.get("user_id") or "").strip().lower()
+        email = str(item.get("email") or "").strip().lower()
+        identity = f"user:{user_id}" if user_id else (f"email:{email}" if email else "")
+        if identity:
+            groups.setdefault(identity, []).append(item)
+    for matches in groups.values():
+        instance_names = sorted({str(item["instance_name"]) for item in matches})
+        if len(instance_names) < 2:
+            continue
+        for item in matches:
+            item["duplicate"] = True
+            item["duplicate_instances"] = instance_names
+
+
+async def _fetch_instance_accounts(
+    item: Instance, low_credit_threshold: float
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    _ensure_compatible(item, "accounts")
+    data = await remote_client.accounts(item.base_url, low_credit_threshold)
+    rows = []
+    for remote_item in data.get("items", []):
+        safe_item = _safe_account(remote_item, item)
+        if safe_item is not None:
+            rows.append(safe_item)
+    remote_summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    summary = {field: remote_summary.get(field) for field in ACCOUNT_SUMMARY_FIELDS}
+    return rows, summary
+
+
+@api_router.get("/accounts")
+async def aggregate_accounts(
+    instance_ids: Optional[str] = None, db: Session = Depends(get_db)
+):
+    instances = _selected_instances(db, instance_ids)
+    threshold = get_low_credit_threshold(db)
+
+    async def fetch(item: Instance):
+        try:
+            rows, summary = await _fetch_instance_accounts(item, threshold)
+            return item, rows, summary, None
+        except (RemoteError, HTTPException) as exc:
+            return item, [], {}, str(exc)
+
+    results = await asyncio.gather(*(fetch(item) for item in instances))
+    accounts: list[dict[str, Any]] = []
+    errors = []
+    summaries = {}
+    for instance, rows, summary, error in results:
+        if error:
+            errors.append(
+                {
+                    "instance_id": instance.id,
+                    "instance_name": instance.name,
+                    "detail": error,
+                }
+            )
+            continue
+        accounts.extend(rows)
+        summaries[instance.id] = summary
+    _mark_duplicate_accounts(accounts)
+    _sort_accounts(accounts)
+    return {
+        "status": "partial" if errors else "ok",
+        "low_credit_threshold": threshold,
+        "accounts": accounts,
+        "instance_summaries": summaries,
+        "errors": errors,
+    }
+
+
+@api_router.get("/instances/{instance_id}/accounts")
+async def instance_accounts(instance_id: str, db: Session = Depends(get_db)):
+    item = _get_instance(db, instance_id)
+    threshold = get_low_credit_threshold(db)
+    try:
+        accounts, summary = await _fetch_instance_accounts(item, threshold)
+    except RemoteError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    _sort_accounts(accounts)
+    return {
+        "status": "ok",
+        "low_credit_threshold": threshold,
+        "accounts": accounts,
+        "summary": summary,
+    }
+
+
 @api_router.get("/tokens")
 async def aggregate_tokens(instance_ids: Optional[str] = None, db: Session = Depends(get_db)):
     instances = _selected_instances(db, instance_ids)
@@ -586,6 +792,62 @@ async def import_refresh_profile(instance_id: str, request: Request, body: dict 
     return await _remote_action(
         db, request, item, action="refresh_profile.import", method="POST", path=path,
         body=body, resource_type="refresh_profile", audit_detail={"count": count}, timeout=120,
+    )
+
+
+@api_router.post(
+    "/instances/{instance_id}/refresh-profiles/delete-batch",
+    dependencies=[Depends(require_csrf)],
+)
+async def delete_refresh_profiles_batch(
+    instance_id: str,
+    payload: AccountBatchRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    item = _get_instance(db, instance_id)
+    ids = list(dict.fromkeys(value.strip() for value in payload.ids if value.strip()))
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+    return await _remote_action(
+        db,
+        request,
+        item,
+        action="refresh_profile.delete_batch",
+        method="POST",
+        path="/api/v1/refresh-profiles/delete-batch",
+        body={"ids": ids},
+        resource_type="refresh_profile",
+        audit_detail={"count": len(ids)},
+        timeout=120,
+    )
+
+
+@api_router.put(
+    "/instances/{instance_id}/refresh-profiles/enabled-batch",
+    dependencies=[Depends(require_csrf)],
+)
+async def set_refresh_profiles_enabled_batch(
+    instance_id: str,
+    payload: AccountBatchEnabledRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    item = _get_instance(db, instance_id)
+    ids = list(dict.fromkeys(value.strip() for value in payload.ids if value.strip()))
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+    return await _remote_action(
+        db,
+        request,
+        item,
+        action="refresh_profile.enabled_batch",
+        method="PUT",
+        path="/api/v1/refresh-profiles/enabled-batch",
+        body={"ids": ids, "enabled": payload.enabled},
+        resource_type="refresh_profile",
+        audit_detail={"count": len(ids), "enabled": payload.enabled},
+        timeout=120,
     )
 
 
@@ -897,15 +1159,40 @@ def audit_events(limit: int = Query(default=100, ge=1, le=500), db: Session = De
 
 
 @api_router.get("/settings")
-def manager_settings():
+def manager_settings(db: Session = Depends(get_db)):
     return {
         "poll_interval_seconds": settings.poll_interval_seconds,
         "request_timeout_seconds": settings.request_timeout_seconds,
         "metrics_retention_days": settings.metrics_retention_days,
         "event_retention_days": settings.event_retention_days,
         "ops_key_configured": bool(settings.ops_key),
+        "low_credit_threshold": get_low_credit_threshold(db),
         **notification_service.status(),
     }
+
+
+@api_router.put("/settings/preferences", dependencies=[Depends(require_csrf)])
+async def update_manager_preferences(
+    payload: ManagerPreferencesUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    previous = get_low_credit_threshold(db)
+    current = set_low_credit_threshold(db, payload.low_credit_threshold)
+    _record_audit(
+        db,
+        request=request,
+        instance_id=None,
+        action="settings.low_credit_threshold",
+        outcome="success",
+        started=started,
+        resource_type="settings",
+        resource_id="low_credit_threshold",
+        detail={"previous": previous, "current": current},
+    )
+    await fleet_poller.run_once()
+    return {"status": "ok", "low_credit_threshold": current}
 
 
 @api_router.post("/settings/notifications/test", dependencies=[Depends(require_csrf)])

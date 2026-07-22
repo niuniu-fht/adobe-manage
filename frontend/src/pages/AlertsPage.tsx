@@ -20,10 +20,10 @@ const ruleLabels: Record<string, string> = {
   instance_offline: "实例离线",
   high_latency: "采集延迟过高",
   high_error_rate: "请求错误率过高",
-  no_active_tokens: "无可用 Token",
+  no_active_tokens: "无可用账号",
   low_credits: "剩余积分过低",
-  token_expiring: "Token 即将到期",
-  refresh_failures: "刷新配置连续失败"
+  token_expiring: "账号凭证即将到期",
+  refresh_failures: "Cookie 账号连续刷新失败"
 };
 
 function displayRule(ruleId: string, fallback: string) {

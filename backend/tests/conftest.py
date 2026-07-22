@@ -18,21 +18,32 @@ from sqlalchemy import delete  # noqa: E402
 
 from app.database import SessionLocal, create_schema  # noqa: E402
 from app.main import app  # noqa: E402
+from app.security import _login_attempts  # noqa: E402
 from app.models import (  # noqa: E402
     AlertEvent,
     AlertRule,
     AlertSilence,
     AuditEvent,
     Instance,
+    ManagerSetting,
     MetricSample,
 )
 
 
 @pytest.fixture(autouse=True)
 def clean_database():
+    _login_attempts.clear()
     create_schema()
     with SessionLocal() as db:
-        for model in (AlertSilence, AlertEvent, MetricSample, AuditEvent, Instance, AlertRule):
+        for model in (
+            AlertSilence,
+            AlertEvent,
+            MetricSample,
+            AuditEvent,
+            Instance,
+            AlertRule,
+            ManagerSetting,
+        ):
             db.execute(delete(model))
         db.commit()
     yield

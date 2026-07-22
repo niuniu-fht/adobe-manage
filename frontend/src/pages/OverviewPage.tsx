@@ -1,24 +1,37 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowRight, Gauge, RefreshCw, Server, TicketCheck } from "lucide-react";
+import { AlertTriangle, ArrowRight, ChevronDown, Gauge, RefreshCw, Save, Server, Upload, UsersRound, WalletCards } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { AccountTable } from "../components/AccountTable";
+import { AccountBatchBar } from "../components/AccountBatchBar";
+import { CookieImportModal } from "../components/CookieImportModal";
 import { Heartbeat } from "../components/Heartbeat";
 import { StatusBadge } from "../components/StatusBadge";
 import { apiFetch, emitToast, formatDuration, formatNumber, formatTime } from "../lib/api";
-import type { FleetInstance } from "../types";
+import type { AccountsResponse, FleetInstance } from "../types";
 
 interface DashboardResponse {
   instances: FleetInstance[];
   summary: { total: number; online: number; offline: number; active_alerts: number };
+  preferences: { low_credit_threshold: number };
   updated_at: number;
 }
 
 export function OverviewPage() {
   const queryClient = useQueryClient();
+  const [expandedId, setExpandedId] = useState("");
+  const [threshold, setThreshold] = useState("100");
   const dashboard = useQuery({
     queryKey: ["dashboard"],
     queryFn: () => apiFetch<DashboardResponse>("/dashboard"),
     refetchInterval: 30000
   });
+  useEffect(() => {
+    if (dashboard.data?.preferences.low_credit_threshold != null) {
+      setThreshold(String(dashboard.data.preferences.low_credit_threshold));
+    }
+  }, [dashboard.data?.preferences.low_credit_threshold]);
+
   const poll = useMutation({
     mutationFn: () => apiFetch("/poll", { method: "POST" }),
     onSuccess: () => {
@@ -27,75 +40,137 @@ export function OverviewPage() {
     },
     onError: (error) => emitToast(error.message, "error")
   });
+  const saveThreshold = useMutation({
+    mutationFn: () => {
+      const value = Number(threshold);
+      if (!Number.isFinite(value) || value < 0) throw new Error("低积分阈值需要填写非负数字");
+      return apiFetch<{ low_credit_threshold: number }>("/settings/preferences", {
+        method: "PUT",
+        body: JSON.stringify({ low_credit_threshold: value })
+      });
+    },
+    onSuccess: async (payload) => {
+      setThreshold(String(payload.low_credit_threshold));
+      emitToast("低积分阈值已保存", "success");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({ queryKey: ["accounts"] }),
+        queryClient.invalidateQueries({ queryKey: ["instance-accounts"] })
+      ]);
+    },
+    onError: (error) => emitToast(error.message, "error")
+  });
 
   const data = dashboard.data;
   const aggregate = (data?.instances || []).reduce(
     (acc, instance) => {
       const snapshot = instance.snapshot;
-      acc.tokens += snapshot?.tokens.active || 0;
-      acc.credits += snapshot?.tokens.credits_available || 0;
-      acc.jobs += snapshot?.requests.in_progress || 0;
+      acc.accounts += snapshot?.accounts?.available ?? snapshot?.tokens.active ?? 0;
+      acc.credits += snapshot?.accounts?.credits_available ?? snapshot?.tokens.credits_available ?? 0;
       return acc;
     },
-    { tokens: 0, credits: 0, jobs: 0 }
+    { accounts: 0, credits: 0 }
   );
 
-  return (
-    <div className="page-stack">
-      <section className="page-toolbar">
-        <div>
-          <strong>{data ? `${data.summary.online}/${data.summary.total} 个实例在线` : "正在读取实例状态"}</strong>
-          <span>最后采集 {formatTime(data?.updated_at)}</span>
-        </div>
-        <button className="secondary-btn" onClick={() => poll.mutate()} disabled={poll.isPending}>
-          <RefreshCw size={16} className={poll.isPending ? "spin" : ""} />立即采集
-        </button>
-      </section>
+  return <div className="page-stack">
+    <section className="page-toolbar">
+      <div><strong>{data ? `${data.summary.online}/${data.summary.total} 个实例在线` : "正在读取实例状态"}</strong><span>最后采集 {formatTime(data?.updated_at)}</span></div>
+      <button className="secondary-btn" onClick={() => poll.mutate()} disabled={poll.isPending}><RefreshCw size={16} className={poll.isPending ? "spin" : ""} />立即采集</button>
+    </section>
 
-      <section className="metric-band">
-        <div><Server size={18} /><span>在线实例</span><strong>{data?.summary.online ?? "-"}</strong></div>
-        <div><TicketCheck size={18} /><span>活跃 Token</span><strong>{aggregate.tokens}</strong></div>
-        <div><Gauge size={18} /><span>剩余积分</span><strong>{formatNumber(aggregate.credits, 1)}</strong></div>
-        <div className={(data?.summary.active_alerts || 0) > 0 ? "metric-alert" : ""}>
-          <AlertTriangle size={18} /><span>当前告警</span><strong>{data?.summary.active_alerts ?? "-"}</strong>
-        </div>
-      </section>
+    <section className="metric-band">
+      <div><Server size={18} /><span>在线实例</span><strong>{data?.summary.online ?? "-"}</strong></div>
+      <div><UsersRound size={18} /><span>可用账号</span><strong>{aggregate.accounts}</strong></div>
+      <div><Gauge size={18} /><span>账号剩余积分</span><strong>{formatNumber(aggregate.credits, 1)}</strong></div>
+      <div className={(data?.summary.active_alerts || 0) > 0 ? "metric-alert" : ""}><AlertTriangle size={18} /><span>当前告警</span><strong>{data?.summary.active_alerts ?? "-"}</strong></div>
+    </section>
 
-      <section className="fleet-section">
-        <div className="section-head"><div><h2>实例运行带</h2><span>最近 7 天逐小时可用性</span></div></div>
-        {dashboard.isLoading && <div className="empty-row">正在加载...</div>}
-        {dashboard.isError && <div className="error-banner">{dashboard.error.message}</div>}
-        {data?.instances.length === 0 && (
-          <div className="empty-row">尚未登记实例 <Link to="/instances">添加实例</Link></div>
-        )}
-        <div className="fleet-list">
-          {data?.instances.map((instance) => {
-            const snapshot = instance.snapshot;
-            const todaySuccessful = snapshot?.requests.today?.successful
-              ?? snapshot?.requests.successful
-              ?? Math.max(0, (snapshot?.requests.total || 0) - (snapshot?.requests.failed || 0));
-            const todayFailed = snapshot?.requests.today?.failed ?? snapshot?.requests.failed;
-            return (
-              <article className="fleet-row" key={instance.id}>
-                <div className="fleet-identity">
-                  <StatusBadge status={instance.state} />
-                  <div><Link to={`/instances/${instance.id}`}>{instance.name}</Link><span>{instance.location || instance.base_url}</span></div>
-                </div>
-                <div className="fleet-stat fleet-secondary"><span>延迟</span><strong>{formatDuration(instance.latency_seconds)}</strong></div>
-                <div className="fleet-stat fleet-secondary"><span>Token</span><strong>{snapshot ? `${snapshot.tokens.active}/${snapshot.tokens.total}` : "-"}</strong></div>
-                <div className="fleet-stat fleet-secondary"><span>积分</span><strong>{formatNumber(snapshot?.tokens.credits_available, 1)}</strong></div>
-                <div className="fleet-stat"><span>进行中</span><strong>{snapshot?.requests.in_progress ?? "-"}</strong></div>
-                <div className="fleet-stat"><span>今日成功</span><strong className="text-success">{snapshot ? todaySuccessful : "-"}</strong></div>
-                <div className="fleet-stat"><span>今日失败</span><strong className={Number(todayFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? todayFailed : "-"}</strong></div>
-                <div className="fleet-stat"><span>错误率</span><strong className={(snapshot?.requests.error_rate || 0) > 0.2 ? "text-danger" : ""}>{snapshot ? `${(snapshot.requests.error_rate * 100).toFixed(1)}%` : "-"}</strong></div>
-                <div className="fleet-mobile-counts"><span>进行中 <strong>{snapshot?.requests.in_progress ?? "-"}</strong></span><span>成功 <strong>{snapshot ? todaySuccessful : "-"}</strong></span><span>失败 <strong className={Number(todayFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? todayFailed : "-"}</strong></span></div>
-                <div className="fleet-heartbeat"><Heartbeat points={instance.heartbeat} /></div>
-                <Link className="icon-btn" to={`/instances/${instance.id}`} title="查看实例"><ArrowRight size={18} /></Link>
-              </article>
-            );
-          })}
-        </div>
-      </section>
+    <section className="fleet-section">
+      <div className="section-head fleet-section-head">
+        <div><h2>实例运行带</h2><span>最近 7 天逐小时可用性</span></div>
+        <label className="threshold-control"><span>低积分阈值</span><input type="number" min="0" value={threshold} onChange={(event) => setThreshold(event.target.value)} /><button className="icon-btn" title="保存低积分阈值" disabled={saveThreshold.isPending} onClick={() => saveThreshold.mutate()}><Save size={15} /></button></label>
+      </div>
+      {dashboard.isLoading && <div className="empty-row">正在加载...</div>}
+      {dashboard.isError && <div className="error-banner">{dashboard.error.message}</div>}
+      {data?.instances.length === 0 && <div className="empty-row">尚未登记实例 <Link to="/instances">添加实例</Link></div>}
+      <div className="fleet-list">
+        {data?.instances.map((instance) => <OverviewInstanceRow
+          key={instance.id}
+          instance={instance}
+          threshold={data.preferences.low_credit_threshold}
+          expanded={expandedId === instance.id}
+          onToggle={() => setExpandedId((current) => current === instance.id ? "" : instance.id)}
+        />)}
+      </div>
+    </section>
+  </div>;
+}
+
+function OverviewInstanceRow({
+  instance,
+  threshold,
+  expanded,
+  onToggle
+}: {
+  instance: FleetInstance;
+  threshold: number;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [importOpen, setImportOpen] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const supportsAccounts = !instance.capabilities.length || instance.capabilities.includes("accounts");
+  const accounts = useQuery({
+    queryKey: ["instance-accounts", instance.id, threshold],
+    queryFn: () => apiFetch<AccountsResponse>(`/instances/${instance.id}/accounts`),
+    enabled: expanded && supportsAccounts,
+    staleTime: 15000
+  });
+  const refreshBalances = useMutation({
+    mutationFn: () => apiFetch(`/instances/${instance.id}/tokens/credits-batch`, { method: "POST", body: JSON.stringify({}) }),
+    onSuccess: async () => {
+      emitToast(`${instance.name} 账号余额已刷新`, "success");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["instance-accounts", instance.id] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] })
+      ]);
+    },
+    onError: (error) => emitToast(error.message, "error")
+  });
+  useEffect(() => {
+    if (!expanded) setSelected(new Set());
+  }, [expanded]);
+
+  const snapshot = instance.snapshot;
+  const accountStats = snapshot?.accounts;
+  const todaySuccessful = snapshot?.requests.today?.successful
+    ?? snapshot?.requests.successful
+    ?? Math.max(0, (snapshot?.requests.total || 0) - (snapshot?.requests.failed || 0));
+  const todayFailed = snapshot?.requests.today?.failed ?? snapshot?.requests.failed;
+  const availableAccounts = accountStats?.available ?? snapshot?.tokens.active;
+  const totalAccounts = accountStats?.total ?? snapshot?.refresh_profiles.total ?? snapshot?.tokens.total;
+
+  return <article className={`fleet-item${expanded ? " fleet-item-expanded" : ""}`}>
+    <div className="fleet-row">
+      <div className="fleet-identity"><StatusBadge status={instance.state} /><div><Link to={`/instances/${instance.id}`}>{instance.name}</Link><span>{instance.location || instance.base_url}</span></div></div>
+      <div className="fleet-stat fleet-secondary"><span>延迟</span><strong>{formatDuration(instance.latency_seconds)}</strong></div>
+      <div className="fleet-stat fleet-secondary account-count-stat"><span>账号</span><strong>{snapshot ? `${availableAccounts}/${totalAccounts}` : "-"}</strong><small className={(accountStats?.low_credit || 0) > 0 ? "text-danger" : ""}>{supportsAccounts ? `低积分 ${accountStats?.low_credit ?? "-"}` : "待升级"}</small></div>
+      <div className="fleet-stat fleet-secondary"><span>积分</span><strong>{formatNumber(accountStats?.credits_available ?? snapshot?.tokens.credits_available, 1)}</strong></div>
+      <div className="fleet-stat"><span>进行中</span><strong>{snapshot?.requests.in_progress ?? "-"}</strong></div>
+      <div className="fleet-stat"><span>今日成功</span><strong className="text-success">{snapshot ? todaySuccessful : "-"}</strong></div>
+      <div className="fleet-stat"><span>今日失败</span><strong className={Number(todayFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? todayFailed : "-"}</strong></div>
+      <div className="fleet-stat"><span>错误率</span><strong className={(snapshot?.requests.error_rate || 0) > 0.2 ? "text-danger" : ""}>{snapshot ? `${(snapshot.requests.error_rate * 100).toFixed(1)}%` : "-"}</strong></div>
+      <div className="fleet-mobile-counts"><span>进行中 <strong>{snapshot?.requests.in_progress ?? "-"}</strong></span><span>成功 <strong>{snapshot ? todaySuccessful : "-"}</strong></span><span>失败 <strong className={Number(todayFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? todayFailed : "-"}</strong></span><span>低积分 <strong className={(accountStats?.low_credit || 0) > 0 ? "text-danger" : ""}>{accountStats?.low_credit ?? "-"}</strong></span></div>
+      <div className="fleet-heartbeat"><Heartbeat points={instance.heartbeat} /></div>
+      <div className="fleet-row-actions"><button className={`icon-btn expand-btn${expanded ? " expanded" : ""}`} title={supportsAccounts ? (expanded ? "收起账号" : "展开账号") : "实例端需要升级"} disabled={!supportsAccounts} onClick={onToggle}><ChevronDown size={18} /></button><Link className="icon-btn" to={`/instances/${instance.id}`} title="查看实例"><ArrowRight size={18} /></Link></div>
     </div>
-  );
+    {expanded && <section className="account-drawer">
+      <div className="account-drawer-head"><div><strong>Cookie 账号</strong><span>按剩余积分从低到高</span></div><div className="inline-actions"><button className="secondary-btn compact-action" onClick={() => setImportOpen(true)}><Upload size={15} />导入</button><button className="secondary-btn compact-action" disabled={refreshBalances.isPending} onClick={() => refreshBalances.mutate()}><WalletCards size={15} />刷新余额</button><button className="icon-btn" title="刷新账号列表" onClick={() => accounts.refetch()}><RefreshCw size={16} className={accounts.isFetching ? "spin" : ""} /></button><Link className="text-link" to={`/instances/${instance.id}?tab=accounts`}>完整管理</Link></div></div>
+      <AccountBatchBar accounts={accounts.data?.accounts || []} selected={selected} onSelectionChange={setSelected} compact />
+      {accounts.isError && <div className="drawer-error">{accounts.error.message}</div>}
+      <div className="account-drawer-scroll"><AccountTable accounts={accounts.data?.accounts || []} compact loading={accounts.isLoading} selected={selected} onSelectionChange={setSelected} /></div>
+    </section>}
+    <CookieImportModal open={importOpen} onClose={() => setImportOpen(false)} fixedInstanceId={instance.id} fixedInstanceName={instance.name} />
+  </article>;
 }

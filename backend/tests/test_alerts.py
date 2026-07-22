@@ -20,6 +20,11 @@ def _snapshot(error_rate=0.0, total=20, active=2, credits_total=100, credits_ava
             "expiring_24h": 0,
         },
         "refresh_profiles": {"consecutive_failures_max": 0},
+        "accounts": {
+            "available": active,
+            "low_credit": 0,
+            "low_credit_threshold": 100,
+        },
     }
 
 
@@ -86,7 +91,7 @@ def test_three_instance_polling_marks_repeated_failure_offline(monkeypatch):
         db.commit()
         targets = [(item.id, item.base_url) for item in instances]
 
-    async def fake_snapshot(base_url):
+    async def fake_snapshot(base_url, _low_credit_threshold=100):
         if "down" in base_url:
             raise RemoteError("connection refused")
         return {
@@ -95,6 +100,14 @@ def test_three_instance_polling_marks_repeated_failure_offline(monkeypatch):
             "requests": {"total": 20, "error_rate": 0, "in_progress": 0},
             "tokens": {"total": 2, "active": 2, "credits_total": 100, "credits_available": 90},
             "refresh_profiles": {"consecutive_failures_max": 0},
+            "accounts": {
+                "total": 2,
+                "available": 2,
+                "low_credit": 0,
+                "credits_total": 100,
+                "credits_available": 90,
+                "low_credit_threshold": 100,
+            },
         }
 
     monkeypatch.setattr(remote_client, "snapshot", fake_snapshot)
@@ -112,4 +125,33 @@ def test_three_instance_polling_marks_repeated_failure_offline(monkeypatch):
         assert rows["West"].state == "online"
         assert rows["Down"].state == "offline"
         assert rows["Down"].consecutive_failures == 3
-        assert len(db.scalars(select(MetricSample)).all()) == 9
+    assert len(db.scalars(select(MetricSample)).all()) == 9
+
+
+def test_low_credit_account_alert_fires_once_and_recovers_twice():
+    with SessionLocal() as db:
+        seed_alert_rules(db)
+        instance = Instance(name="East", base_url="https://east.example", state="online")
+        db.add(instance)
+        db.commit()
+
+        snapshot = _snapshot()
+        snapshot["accounts"]["low_credit"] = 2
+        notifications = evaluate_alerts(
+            db, instance, snapshot, poll_succeeded=True, now=100
+        )
+        assert [item.transition for item in notifications if item.rule.id == "low_credits"] == [
+            "firing"
+        ]
+
+        snapshot["accounts"]["low_credit"] = 0
+        first_recovery = evaluate_alerts(
+            db, instance, snapshot, poll_succeeded=True, now=200
+        )
+        second_recovery = evaluate_alerts(
+            db, instance, snapshot, poll_succeeded=True, now=201
+        )
+        assert not [item for item in first_recovery if item.rule.id == "low_credits"]
+        assert [
+            item.transition for item in second_recovery if item.rule.id == "low_credits"
+        ] == ["resolved"]

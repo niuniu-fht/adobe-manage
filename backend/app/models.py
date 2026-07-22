@@ -128,3 +128,11 @@ class AuditEvent(Base):
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     request_id: Mapped[str] = mapped_column(String(80), default="")
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ManagerSetting(Base):
+    __tablename__ = "manager_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[Any] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, default=now_ts, onupdate=now_ts)

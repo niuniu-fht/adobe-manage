@@ -1,8 +1,8 @@
 import {
   Activity,
   BellRing,
-  Boxes,
   ClipboardList,
+  Cookie,
   FileClock,
   LogOut,
   Menu,
@@ -17,7 +17,7 @@ import { apiFetch, emitToast, setCsrfToken } from "../lib/api";
 const navItems = [
   { to: "/", label: "总览", icon: Activity },
   { to: "/instances", label: "实例", icon: ServerCog },
-  { to: "/tokens", label: "Token", icon: Boxes },
+  { to: "/accounts", label: "Cookie账号", icon: Cookie },
   { to: "/logs", label: "请求日志", icon: FileClock },
   { to: "/alerts", label: "告警", icon: BellRing },
   { to: "/audit", label: "操作审计", icon: ClipboardList },
@@ -27,7 +27,7 @@ const navItems = [
 const titleMap: Record<string, string> = {
   "/": "运行总览",
   "/instances": "实例管理",
-  "/tokens": "Token 管理",
+  "/accounts": "Cookie 账号",
   "/logs": "请求日志",
   "/alerts": "告警中心",
   "/audit": "操作审计",

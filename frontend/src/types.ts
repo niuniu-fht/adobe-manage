@@ -44,6 +44,7 @@ export interface InstanceSnapshot {
     failing: number;
     consecutive_failures_max: number;
   };
+  accounts?: AccountSummary;
   storage: {
     generated_usage_bytes: number;
     generated_usage_mb: number;
@@ -73,23 +74,59 @@ export interface FleetInstance {
   updated_at: number;
 }
 
-export interface TokenItem {
+export interface AccountSummary {
+  total: number;
+  available: number;
+  low_credit: number;
+  balance_unknown: number;
+  refresh_failing: number;
+  credential_error: number;
+  credits_available: number;
+  credits_total: number;
+  low_credit_threshold: number;
+}
+
+export type AccountHealth =
+  | "healthy"
+  | "low_credit"
+  | "balance_unknown"
+  | "refresh_failed"
+  | "credential_error"
+  | "disabled";
+
+export interface AccountItem {
   id: string;
-  value: string;
-  status: string;
-  fails: number;
-  source: string;
-  auto_refresh: boolean;
-  auto_refresh_enabled?: boolean | null;
-  refresh_profile_name?: string;
-  refresh_profile_email?: string;
-  credits_total?: number | null;
+  name: string;
+  display_name: string;
+  email: string;
+  user_id: string;
+  enabled: boolean;
+  health: AccountHealth;
+  low_credit: boolean;
   credits_available?: number | null;
+  credits_total?: number | null;
   credits_updated_at?: number | null;
-  expires_at?: number | null;
-  remaining_seconds?: number | null;
+  credential_status: string;
+  credential_expires_at?: number | null;
+  consecutive_failures: number;
+  last_attempt_at?: number | null;
+  last_success_at?: number | null;
+  next_refresh_at?: number | null;
+  last_error: string;
+  imported_at?: number | null;
   instance_id: string;
   instance_name: string;
+  duplicate: boolean;
+  duplicate_instances?: string[];
+}
+
+export interface AccountsResponse {
+  status: "ok" | "partial";
+  low_credit_threshold: number;
+  accounts: AccountItem[];
+  summary?: AccountSummary;
+  instance_summaries?: Record<string, AccountSummary>;
+  errors?: { instance_id: string; instance_name: string; detail: string }[];
 }
 
 export interface LogItem {

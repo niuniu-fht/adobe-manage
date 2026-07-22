@@ -82,10 +82,30 @@ class AdobeInstanceClient:
             )
         return RemoteResponse(response.status_code, data, dict(response.headers))
 
-    async def snapshot(self, base_url: str) -> dict[str, Any]:
-        response = await self.request(base_url, "GET", "/api/v1/ops/snapshot")
+    async def snapshot(
+        self, base_url: str, low_credit_threshold: float = 100.0
+    ) -> dict[str, Any]:
+        response = await self.request(
+            base_url,
+            "GET",
+            "/api/v1/ops/snapshot",
+            params={"low_credit_threshold": low_credit_threshold},
+        )
         if not isinstance(response.data, dict):
             raise RemoteError("Invalid snapshot response")
+        return response.data
+
+    async def accounts(
+        self, base_url: str, low_credit_threshold: float
+    ) -> dict[str, Any]:
+        response = await self.request(
+            base_url,
+            "GET",
+            "/api/v1/ops/accounts",
+            params={"low_credit_threshold": low_credit_threshold},
+        )
+        if not isinstance(response.data, dict):
+            raise RemoteError("Invalid accounts response")
         return response.data
 
     async def logs(

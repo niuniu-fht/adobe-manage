@@ -14,4 +14,4 @@ def test_migrate_schema_stamps_an_unversioned_existing_database():
         version = connection.execute(
             text("SELECT version_num FROM alembic_version")
         ).scalar_one()
-    assert version == "0002_request_outcomes"
+    assert version == "0003_account_preferences"

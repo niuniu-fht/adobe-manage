@@ -38,7 +38,7 @@ DEFAULT_RULES = [
     },
     {
         "id": "no_active_tokens",
-        "name": "No active tokens",
+        "name": "No available accounts",
         "severity": "critical",
         "threshold": 0,
         "minimum_requests": 0,
@@ -47,16 +47,16 @@ DEFAULT_RULES = [
     },
     {
         "id": "low_credits",
-        "name": "Low available credits",
+        "name": "Low-credit accounts",
         "severity": "warning",
-        "threshold": 0.20,
+        "threshold": 1,
         "minimum_requests": 0,
-        "pending_samples": 2,
+        "pending_samples": 1,
         "recovery_samples": 2,
     },
     {
         "id": "token_expiring",
-        "name": "Token expires within 24 hours",
+        "name": "Account credential expires within 24 hours",
         "severity": "warning",
         "threshold": 1,
         "minimum_requests": 0,
@@ -110,6 +110,11 @@ def _condition(
         if isinstance(snapshot.get("refresh_profiles"), dict)
         else {}
     )
+    accounts = (
+        snapshot.get("accounts")
+        if isinstance(snapshot.get("accounts"), dict)
+        else None
+    )
     if rule.id == "high_latency":
         value = float(instance.last_latency_seconds or 0)
         return value > rule.threshold, value, f"Collection latency is {value:.2f}s"
@@ -119,13 +124,22 @@ def _condition(
         triggered = total >= rule.minimum_requests and value > rule.threshold
         return triggered, value, f"5-minute error rate is {value:.1%} across {total} requests"
     if rule.id == "no_active_tokens":
-        value = float(tokens.get("active") or 0)
-        return value <= rule.threshold, value, "No active token is available"
+        value = float(
+            accounts.get("available")
+            if accounts is not None and accounts.get("available") is not None
+            else tokens.get("active") or 0
+        )
+        return value <= rule.threshold, value, "No available account is ready"
     if rule.id == "low_credits":
-        total = float(tokens.get("credits_total") or 0)
-        available = float(tokens.get("credits_available") or 0)
-        value = available / total if total > 0 else 1.0
-        return total > 0 and value < rule.threshold, value, f"Available credits are {value:.1%}"
+        if accounts is None:
+            return None
+        value = float(accounts.get("low_credit") or 0)
+        credit_threshold = float(accounts.get("low_credit_threshold") or 0)
+        return (
+            value >= rule.threshold,
+            value,
+            f"{int(value)} account(s) have fewer than {credit_threshold:g} credits",
+        )
     if rule.id == "token_expiring":
         value = float(tokens.get("expiring_24h") or 0)
         return value >= rule.threshold, value, f"{int(value)} token(s) expire within 24 hours"

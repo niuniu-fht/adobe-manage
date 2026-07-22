@@ -10,6 +10,7 @@ from .config import settings
 from .database import SessionLocal
 from .models import AlertEvent, AlertSilence, AuditEvent, Instance, MetricSample
 from .notifications import notification_service
+from .preferences import get_low_credit_threshold
 from .remote import RemoteError, remote_client
 
 
@@ -49,6 +50,7 @@ class FleetPoller:
 
     async def run_once(self) -> None:
         with SessionLocal() as db:
+            low_credit_threshold = get_low_credit_threshold(db)
             targets = [
                 (item.id, item.base_url)
                 for item in db.scalars(
@@ -57,17 +59,24 @@ class FleetPoller:
             ]
         if targets:
             await asyncio.gather(
-                *(self._poll_instance(instance_id, base_url) for instance_id, base_url in targets)
+                *(
+                    self._poll_instance(
+                        instance_id, base_url, low_credit_threshold
+                    )
+                    for instance_id, base_url in targets
+                )
             )
         if time.time() - self._last_cleanup >= 3600:
             self.cleanup()
 
-    async def _poll_instance(self, instance_id: str, base_url: str) -> None:
+    async def _poll_instance(
+        self, instance_id: str, base_url: str, low_credit_threshold: float = 100.0
+    ) -> None:
         started = time.perf_counter()
         snapshot: Optional[dict[str, Any]] = None
         error = ""
         try:
-            snapshot = await remote_client.snapshot(base_url)
+            snapshot = await remote_client.snapshot(base_url, low_credit_threshold)
         except RemoteError as exc:
             error = str(exc)
         latency = time.perf_counter() - started
@@ -101,6 +110,7 @@ class FleetPoller:
 
             request_stats = snapshot.get("requests", {}) if snapshot else {}
             token_stats = snapshot.get("tokens", {}) if snapshot else {}
+            account_stats = snapshot.get("accounts", {}) if snapshot else {}
             request_total = int(request_stats.get("total") or 0)
             failed_requests = int(request_stats.get("failed") or 0)
             db.add(
@@ -120,10 +130,26 @@ class FleetPoller:
                     duration_p95_seconds=float(
                         request_stats.get("duration_p95_seconds") or 0
                     ),
-                    active_tokens=int(token_stats.get("active") or 0),
-                    total_tokens=int(token_stats.get("total") or 0),
-                    credits_available=float(token_stats.get("credits_available") or 0),
-                    credits_total=float(token_stats.get("credits_total") or 0),
+                    active_tokens=int(
+                        account_stats.get("available")
+                        if account_stats.get("available") is not None
+                        else token_stats.get("active") or 0
+                    ),
+                    total_tokens=int(
+                        account_stats.get("total")
+                        if account_stats.get("total") is not None
+                        else token_stats.get("total") or 0
+                    ),
+                    credits_available=float(
+                        account_stats.get("credits_available")
+                        if account_stats.get("credits_available") is not None
+                        else token_stats.get("credits_available") or 0
+                    ),
+                    credits_total=float(
+                        account_stats.get("credits_total")
+                        if account_stats.get("credits_total") is not None
+                        else token_stats.get("credits_total") or 0
+                    ),
                     in_progress=int(request_stats.get("in_progress") or 0),
                 )
             )

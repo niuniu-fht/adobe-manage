@@ -55,11 +55,12 @@ def migrate_schema() -> None:
         metric_columns = {
             column["name"] for column in inspector.get_columns("metric_samples")
         }
-        baseline = (
-            "0002_request_outcomes"
-            if {"successful_requests", "failed_requests"} <= metric_columns
-            else "0001_initial"
-        )
+        if "manager_settings" in table_names:
+            baseline = "0003_account_preferences"
+        elif {"successful_requests", "failed_requests"} <= metric_columns:
+            baseline = "0002_request_outcomes"
+        else:
+            baseline = "0001_initial"
         with engine.begin() as connection:
             if "alembic_version" not in table_names:
                 connection.execute(

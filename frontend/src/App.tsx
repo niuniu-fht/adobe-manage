@@ -9,7 +9,7 @@ import { LoginPage } from "./pages/LoginPage";
 const OverviewPage = lazy(() => import("./pages/OverviewPage").then((module) => ({ default: module.OverviewPage })));
 const InstancesPage = lazy(() => import("./pages/InstancesPage").then((module) => ({ default: module.InstancesPage })));
 const InstanceDetailPage = lazy(() => import("./pages/InstanceDetailPage").then((module) => ({ default: module.InstanceDetailPage })));
-const TokensPage = lazy(() => import("./pages/TokensPage").then((module) => ({ default: module.TokensPage })));
+const AccountsPage = lazy(() => import("./pages/AccountsPage").then((module) => ({ default: module.AccountsPage })));
 const LogsPage = lazy(() => import("./pages/LogsPage").then((module) => ({ default: module.LogsPage })));
 const AlertsPage = lazy(() => import("./pages/AlertsPage").then((module) => ({ default: module.AlertsPage })));
 const AuditPage = lazy(() => import("./pages/AuditPage").then((module) => ({ default: module.AuditPage })));
@@ -49,7 +49,8 @@ export function App() {
             <Route index element={<OverviewPage />} />
             <Route path="instances" element={<InstancesPage />} />
             <Route path="instances/:instanceId" element={<InstanceDetailPage />} />
-            <Route path="tokens" element={<TokensPage />} />
+            <Route path="accounts" element={<AccountsPage />} />
+            <Route path="tokens" element={<Navigate to="/accounts" replace />} />
             <Route path="logs" element={<LogsPage />} />
             <Route path="alerts" element={<AlertsPage />} />
             <Route path="audit" element={<AuditPage />} />
