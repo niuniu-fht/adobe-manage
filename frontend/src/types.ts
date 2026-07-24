@@ -129,6 +129,94 @@ export interface AccountsResponse {
   errors?: { instance_id: string; instance_name: string; detail: string }[];
 }
 
+export interface AccountMoveResponse {
+  status: "ok" | "partial" | "failed";
+  source: { id: string; name: string };
+  target: { id: string; name: string };
+  requested_count: number;
+  exported_count: number;
+  imported_count: number;
+  moved_count: number;
+  retained_count: number;
+  export_missing_count: number;
+  import_failed_count: number;
+  refresh_failed_count: number;
+  cleanup_failed_count: number;
+  source_state_unknown_count: number;
+}
+
+export interface ImageQueueOutput {
+  index: number;
+  state: string;
+  token_id?: string | null;
+  account_name?: string | null;
+  upstream_job_id?: string | null;
+  retry_count: number;
+  next_run_at?: number | null;
+  rate_limit_wait_seconds: number;
+  download_attempt: number;
+  last_error?: string | null;
+  updated_at?: number | null;
+}
+
+export interface ImageQueueRequest {
+  id: string;
+  log_id: string;
+  instance_id: string;
+  instance_name: string;
+  instance_location: string;
+  path: string;
+  model: string;
+  prompt_preview: string;
+  requested_count: number;
+  completed_count: number;
+  state: string;
+  created_at?: number | null;
+  updated_at?: number | null;
+  finished_at?: number | null;
+  elapsed_seconds: number;
+  error?: string | null;
+  outputs: ImageQueueOutput[];
+}
+
+export interface ImageQueueResponse {
+  status: "ok" | "partial";
+  summary: {
+    instances: number;
+    instances_ok: number;
+    instances_error: number;
+    requests: number;
+    outputs: number;
+    in_progress: number;
+    queued: number;
+    waiting_poll: number;
+    rate_limited: number;
+    download_retry: number;
+  };
+  instances: {
+    instance_id: string;
+    instance_name: string;
+    state: "ok" | "error";
+    summary: Record<string, number>;
+    error: string;
+  }[];
+  items: ImageQueueRequest[];
+  errors: { instance_id: string; instance_name: string; detail: string }[];
+  updated_at: number;
+}
+
+export interface FleetCreditsRefreshResponse {
+  status: "ok" | "partial";
+  summary: {
+    instances: number;
+    succeeded_instances: number;
+    partial_instances: number;
+    failed_instances: number;
+    refreshed_count: number;
+    failed_count: number;
+  };
+}
+
 export interface LogItem {
   id: string;
   ts: number;

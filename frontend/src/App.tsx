@@ -10,6 +10,7 @@ const OverviewPage = lazy(() => import("./pages/OverviewPage").then((module) => 
 const InstancesPage = lazy(() => import("./pages/InstancesPage").then((module) => ({ default: module.InstancesPage })));
 const InstanceDetailPage = lazy(() => import("./pages/InstanceDetailPage").then((module) => ({ default: module.InstanceDetailPage })));
 const AccountsPage = lazy(() => import("./pages/AccountsPage").then((module) => ({ default: module.AccountsPage })));
+const ImageQueuePage = lazy(() => import("./pages/ImageQueuePage").then((module) => ({ default: module.ImageQueuePage })));
 const LogsPage = lazy(() => import("./pages/LogsPage").then((module) => ({ default: module.LogsPage })));
 const AlertsPage = lazy(() => import("./pages/AlertsPage").then((module) => ({ default: module.AlertsPage })));
 const AuditPage = lazy(() => import("./pages/AuditPage").then((module) => ({ default: module.AuditPage })));
@@ -50,6 +51,7 @@ export function App() {
             <Route path="instances" element={<InstancesPage />} />
             <Route path="instances/:instanceId" element={<InstanceDetailPage />} />
             <Route path="accounts" element={<AccountsPage />} />
+            <Route path="queue" element={<ImageQueuePage />} />
             <Route path="tokens" element={<Navigate to="/accounts" replace />} />
             <Route path="logs" element={<LogsPage />} />
             <Route path="alerts" element={<AlertsPage />} />

@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { CirclePause, CirclePlay, Trash2, X } from "lucide-react";
+import { CirclePause, CirclePlay, MoveRight, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { apiFetch, emitToast } from "../lib/api";
 import type { AccountItem } from "../types";
@@ -8,11 +8,13 @@ export function AccountBatchBar({
   accounts,
   selected,
   onSelectionChange,
+  onMove,
   compact = false
 }: {
   accounts: AccountItem[];
   selected: Set<string>;
   onSelectionChange: (selected: Set<string>) => void;
+  onMove?: () => void;
   compact?: boolean;
 }) {
   const queryClient = useQueryClient();
@@ -64,6 +66,7 @@ export function AccountBatchBar({
   return <div className={`batch-toolbar${compact ? " batch-toolbar-compact" : ""}`}>
     <strong>已选 {selectedAccounts.length}</strong><span>{targetSummary}</span>
     <div className="inline-actions">
+      {onMove && <button className="secondary-btn compact-action" disabled={Boolean(busy)} onClick={onMove}><MoveRight size={15} />批量移动</button>}
       <button className="secondary-btn compact-action" disabled={Boolean(busy)} onClick={() => run("enable")}><CirclePlay size={15} />批量启用</button>
       <button className="secondary-btn compact-action" disabled={Boolean(busy)} onClick={() => run("disable")}><CirclePause size={15} />批量暂停</button>
       <button className="secondary-btn compact-action batch-danger" disabled={Boolean(busy)} onClick={() => run("delete")}><Trash2 size={15} />批量删除</button>

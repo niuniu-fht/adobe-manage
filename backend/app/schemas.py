@@ -77,5 +77,28 @@ class AccountBatchEnabledRequest(AccountBatchRequest):
     enabled: bool
 
 
+class AccountMoveRequest(AccountBatchRequest):
+    target_instance_id: str = Field(min_length=1, max_length=100)
+
+
+class FleetAccountTarget(BaseModel):
+    instance_id: str = Field(min_length=1, max_length=100)
+    target_count: int = Field(ge=0, le=1_000_000)
+
+
+class FleetCookieImportItem(BaseModel):
+    cookie: str = Field(min_length=1, max_length=200_000)
+    name: Optional[str] = Field(default=None, max_length=300)
+
+
+class FleetCookieImportRequest(BaseModel):
+    items: list[FleetCookieImportItem] = Field(min_length=1, max_length=5000)
+    targets: list[FleetAccountTarget] = Field(min_length=1, max_length=200)
+
+
+class FleetLowCreditDeleteRequest(BaseModel):
+    credit_threshold: float = Field(ge=0, le=1_000_000_000)
+
+
 class JsonPayload(BaseModel):
     data: dict[str, Any]

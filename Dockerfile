@@ -19,7 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./
 COPY --from=frontend-build /build/frontend/dist /app/frontend/dist
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh && mkdir -p /app/data
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chmod +x /app/docker-entrypoint.sh \
+    && mkdir -p /app/data
 
 EXPOSE 8000
 VOLUME ["/app/data"]

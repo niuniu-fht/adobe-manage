@@ -131,5 +131,18 @@ class AdobeInstanceClient:
             raise RemoteError("Invalid logs response")
         return response.data
 
+    async def image_queue(
+        self, base_url: str, *, limit: int = 200
+    ) -> dict[str, Any]:
+        response = await self.request(
+            base_url,
+            "GET",
+            "/api/v1/image-queue",
+            params={"limit": min(max(1, int(limit)), 1000)},
+        )
+        if not isinstance(response.data, dict):
+            raise RemoteError("Invalid image queue response")
+        return response.data
+
 
 remote_client = AdobeInstanceClient()

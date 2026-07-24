@@ -287,3 +287,683 @@ def test_account_batch_actions_are_grouped_per_instance_and_audited(
         ).all()
         assert [audit.detail["count"] for audit in audits] == [2, 2]
         assert "profile-a" not in str([audit.detail for audit in audits])
+
+
+def test_account_move_imports_target_before_deleting_source_and_preserves_headers(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        source = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        target = Instance(
+            name="West",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        db.add_all([source, target])
+        db.commit()
+        source_id, target_id = source.id, target.id
+
+    calls = []
+    secret = "SECRET_COOKIE_VALUE"
+
+    async def fake_request(base_url, method, path, **kwargs):
+        calls.append((base_url, method, path, kwargs.get("json")))
+        if path.endswith("export-cookies"):
+            return RemoteResponse(
+                200,
+                {
+                    "status": "ok",
+                    "items": [
+                        {
+                            "id": "profile-a",
+                            "name": "Account A",
+                            "cookie": secret,
+                            "headers": {"x-arp-session-id": "arp-session"},
+                        },
+                        {
+                            "id": "profile-b",
+                            "name": "Account B",
+                            "cookie": "sid=b",
+                        },
+                    ],
+                },
+                {},
+            )
+        if path.endswith("import-cookie-batch"):
+            assert base_url == "https://west.example"
+            assert kwargs["json"]["items"] == [
+                {
+                    "cookie": {
+                        "cookie": secret,
+                        "headers": {"x-arp-session-id": "arp-session"},
+                    },
+                    "name": "Account A",
+                },
+                {"cookie": {"cookie": "sid=b"}, "name": "Account B"},
+            ]
+            return RemoteResponse(
+                200,
+                {
+                    "status": "ok",
+                    "imported_count": 2,
+                    "failed_count": 0,
+                    "refresh_failed_count": 1,
+                    "profiles": [{"id": "target-a"}, {"id": "target-b"}],
+                    "failed": [],
+                },
+                {},
+            )
+        assert base_url == "https://east.example"
+        assert path.endswith("delete-batch")
+        assert kwargs["json"] == {"ids": ["profile-a", "profile-b"]}
+        return RemoteResponse(
+            200,
+            {
+                "status": "ok",
+                "deleted_count": 2,
+                "missing_count": 0,
+                "deleted_ids": ["profile-a", "profile-b"],
+                "missing_ids": [],
+            },
+            {},
+        )
+
+    polls = []
+
+    async def fake_poll():
+        polls.append(True)
+
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    response = client.post(
+        f"/api/instances/{source_id}/refresh-profiles/move",
+        headers=headers,
+        json={"ids": ["profile-a", "profile-b"], "target_instance_id": target_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "source": {"id": source_id, "name": "East"},
+        "target": {"id": target_id, "name": "West"},
+        "requested_count": 2,
+        "exported_count": 2,
+        "imported_count": 2,
+        "moved_count": 2,
+        "retained_count": 0,
+        "export_missing_count": 0,
+        "import_failed_count": 0,
+        "refresh_failed_count": 1,
+        "cleanup_failed_count": 0,
+        "source_state_unknown_count": 0,
+    }
+    assert [call[2] for call in calls] == [
+        "/api/v1/refresh-profiles/export-cookies",
+        "/api/v1/refresh-profiles/import-cookie-batch",
+        "/api/v1/refresh-profiles/delete-batch",
+    ]
+    assert polls == [True]
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "refresh_profile.move_batch"
+        ).one()
+        assert audit.outcome == "success"
+        assert audit.detail["moved_count"] == 2
+        assert secret not in str(audit.detail)
+        assert "profile-a" not in str(audit.detail)
+
+
+def test_account_move_keeps_failed_imports_at_source(authenticated, monkeypatch):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        source = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        target = Instance(
+            name="West",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        db.add_all([source, target])
+        db.commit()
+        source_id, target_id = source.id, target.id
+
+    delete_bodies = []
+
+    async def fake_request(base_url, _method, path, **kwargs):
+        if path.endswith("export-cookies"):
+            return RemoteResponse(
+                200,
+                {
+                    "items": [
+                        {"id": "profile-a", "name": "A", "cookie": "sid=a"},
+                        {"id": "profile-b", "name": "B", "cookie": "sid=b"},
+                    ]
+                },
+                {},
+            )
+        if path.endswith("import-cookie-batch"):
+            return RemoteResponse(
+                200,
+                {
+                    "status": "partial",
+                    "imported_count": 1,
+                    "failed_count": 1,
+                    "refresh_failed_count": 0,
+                    "profiles": [{"id": "target-a"}],
+                    "failed": [{"index": 1, "detail": "bad cookie"}],
+                },
+                {},
+            )
+        delete_bodies.append((base_url, kwargs["json"]))
+        return RemoteResponse(
+            200,
+            {
+                "status": "ok",
+                "deleted_count": 1,
+                "missing_count": 0,
+                "deleted_ids": ["profile-a"],
+            },
+            {},
+        )
+
+    async def fake_poll():
+        return None
+
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    response = client.post(
+        f"/api/instances/{source_id}/refresh-profiles/move",
+        headers=headers,
+        json={"ids": ["profile-a", "profile-b"], "target_instance_id": target_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial"
+    assert response.json()["moved_count"] == 1
+    assert response.json()["retained_count"] == 1
+    assert response.json()["import_failed_count"] == 1
+    assert delete_bodies == [
+        ("https://east.example", {"ids": ["profile-a"]})
+    ]
+
+
+def test_account_move_rolls_back_target_when_source_delete_is_partial(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        source = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        target = Instance(
+            name="West",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        db.add_all([source, target])
+        db.commit()
+        source_id, target_id = source.id, target.id
+
+    delete_calls = []
+
+    async def fake_request(base_url, _method, path, **kwargs):
+        if path.endswith("export-cookies"):
+            return RemoteResponse(
+                200,
+                {
+                    "items": [
+                        {"id": "profile-a", "cookie": "sid=a"},
+                        {"id": "profile-b", "cookie": "sid=b"},
+                    ]
+                },
+                {},
+            )
+        if path.endswith("import-cookie-batch"):
+            return RemoteResponse(
+                200,
+                {
+                    "imported_count": 2,
+                    "profiles": [{"id": "target-a"}, {"id": "target-b"}],
+                    "failed": [],
+                },
+                {},
+            )
+        delete_calls.append((base_url, kwargs["json"]))
+        if base_url == "https://east.example":
+            return RemoteResponse(
+                200,
+                {"status": "partial", "deleted_count": 1, "deleted_ids": ["profile-a"]},
+                {},
+            )
+        return RemoteResponse(
+            200,
+            {"status": "ok", "deleted_count": 1, "deleted_ids": ["target-b"]},
+            {},
+        )
+
+    async def fake_poll():
+        return None
+
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    response = client.post(
+        f"/api/instances/{source_id}/refresh-profiles/move",
+        headers=headers,
+        json={"ids": ["profile-a", "profile-b"], "target_instance_id": target_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial"
+    assert response.json()["moved_count"] == 1
+    assert response.json()["retained_count"] == 1
+    assert response.json()["cleanup_failed_count"] == 0
+    assert delete_calls == [
+        ("https://east.example", {"ids": ["profile-a", "profile-b"]}),
+        ("https://west.example", {"ids": ["target-b"]}),
+    ]
+
+
+def test_fleet_import_fills_targets_then_distributes_remainder(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        east = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        west = Instance(
+            name="West",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        db.add_all([east, west])
+        db.commit()
+        east_id, west_id = east.id, west.id
+
+    async def fake_accounts(base_url, low_credit_threshold):
+        total = 1 if "east" in base_url else 3
+        return {
+            "items": [
+                {
+                    "id": f"existing-{index}",
+                    "credits_available": 500,
+                    "health": "healthy",
+                }
+                for index in range(total)
+            ],
+            "summary": {
+                "total": total,
+                "low_credit_threshold": low_credit_threshold,
+            },
+        }
+
+    calls = {}
+
+    async def fake_request(base_url, method, path, **kwargs):
+        assert method == "POST"
+        assert path == "/api/v1/refresh-profiles/import-cookie-batch"
+        items = kwargs["json"]["items"]
+        calls[base_url] = items
+        return RemoteResponse(
+            200,
+            {
+                "status": "ok",
+                "imported_count": len(items),
+                "failed_count": 0,
+                "refreshed_count": len(items),
+                "refresh_failed_count": 0,
+            },
+            {},
+        )
+
+    polls = []
+
+    async def fake_poll():
+        polls.append(True)
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    secret = "SECRET_COOKIE_VALUE"
+    response = client.post(
+        "/api/fleet/accounts/import",
+        headers=headers,
+        json={
+            "items": [
+                {"name": f"Account {index}", "cookie": f"{secret}_{index}"}
+                for index in range(5)
+            ],
+            "targets": [
+                {"instance_id": east_id, "target_count": 2},
+                {"instance_id": west_id, "target_count": 3},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["imported"] == 5
+    assert len(calls["https://east.example"]) == 3
+    assert len(calls["https://west.example"]) == 2
+    assert polls == [True]
+    dashboard = client.get("/api/dashboard").json()
+    assert dashboard["preferences"]["account_targets"] == {
+        east_id: 2,
+        west_id: 3,
+    }
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "fleet.account_import"
+        ).one()
+        assert audit.detail["item_count"] == 5
+        assert secret not in str(audit.detail)
+
+
+def test_fleet_low_credit_delete_uses_strict_threshold_and_skips_unknown(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        east = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        west = Instance(
+            name="West",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        db.add_all([east, west])
+        db.commit()
+
+    async def fake_accounts(base_url, _low_credit_threshold):
+        if "east" in base_url:
+            values = [("low", 49), ("equal", 50), ("unknown", None)]
+        else:
+            values = [("zero", 0), ("healthy", 500)]
+        return {
+            "items": [
+                {
+                    "id": profile_id,
+                    "credits_available": credits,
+                    "health": "balance_unknown" if credits is None else "healthy",
+                }
+                for profile_id, credits in values
+            ],
+            "summary": {"total": len(values)},
+        }
+
+    calls = {}
+
+    async def fake_request(base_url, method, path, **kwargs):
+        assert method == "POST"
+        assert path == "/api/v1/refresh-profiles/delete-batch"
+        ids = kwargs["json"]["ids"]
+        calls[base_url] = ids
+        return RemoteResponse(
+            200,
+            {
+                "status": "ok",
+                "deleted_count": len(ids),
+                "missing_count": 0,
+            },
+            {},
+        )
+
+    async def fake_poll():
+        return None
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    response = client.post(
+        "/api/fleet/accounts/delete-low-credit",
+        headers=headers,
+        json={"credit_threshold": 50},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["matched_count"] == 2
+    assert response.json()["deleted_count"] == 2
+    assert calls == {
+        "https://east.example": ["low"],
+        "https://west.example": ["zero"],
+    }
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "fleet.low_credit_delete"
+        ).one()
+        assert audit.detail["credit_threshold"] == 50
+        assert "low" not in str(audit.detail)
+
+
+def test_fleet_mutations_abort_when_any_instance_preflight_fails(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        east = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        west = Instance(
+            name="West",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        db.add_all([east, west])
+        db.commit()
+        east_id, west_id = east.id, west.id
+
+    async def fake_accounts(base_url, _low_credit_threshold):
+        if "west" in base_url:
+            raise RemoteError("offline")
+        return {"items": [], "summary": {"total": 0}}
+
+    calls = []
+
+    async def fake_request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return RemoteResponse(200, {}, {})
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    response = client.post(
+        "/api/fleet/accounts/import",
+        headers=headers,
+        json={
+            "items": [{"cookie": "a=1"}],
+            "targets": [
+                {"instance_id": east_id, "target_count": 1},
+                {"instance_id": west_id, "target_count": 1},
+            ],
+        },
+    )
+
+    assert response.status_code == 502
+    assert "未执行变更" in response.json()["detail"]
+    assert calls == []
+
+
+def test_image_queue_aggregates_instances_and_keeps_partial_errors(
+    authenticated, monkeypatch
+):
+    client, _headers = authenticated
+    with SessionLocal() as db:
+        east = Instance(
+            name="East",
+            location="Tokyo",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["image_queue"],
+        )
+        west = Instance(
+            name="West",
+            location="Paris",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["image_queue"],
+        )
+        db.add_all([east, west])
+        db.commit()
+
+    async def fake_image_queue(base_url, *, limit):
+        assert limit == 150
+        if "west" in base_url:
+            raise RemoteError("offline")
+        return {
+            "summary": {
+                "requests": 1,
+                "outputs": 2,
+                "in_progress": 1,
+                "queued": 0,
+                "waiting_poll": 1,
+                "rate_limited": 0,
+                "download_retry": 0,
+            },
+            "items": [
+                {
+                    "id": "queue-1",
+                    "log_id": "log-1",
+                    "path": "/v1/images/generations",
+                    "model": "gpt-image-2",
+                    "prompt_preview": "draw",
+                    "requested_count": 2,
+                    "completed_count": 1,
+                    "state": "WAITING_POLL",
+                    "created_at": 100,
+                    "elapsed_seconds": 10,
+                    "authorization": "SECRET",
+                    "outputs": [
+                        {
+                            "index": 0,
+                            "state": "COMPLETED",
+                            "token_id": "masked-token",
+                        },
+                        {
+                            "index": 1,
+                            "state": "WAITING_POLL",
+                            "upstream_job_id": "job-1",
+                        },
+                    ],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(remote_client, "image_queue", fake_image_queue)
+    response = client.get("/api/image-queue?limit_per_instance=150")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "partial"
+    assert payload["summary"] == {
+        "instances": 2,
+        "instances_ok": 1,
+        "instances_error": 1,
+        "requests": 1,
+        "outputs": 2,
+        "in_progress": 1,
+        "queued": 0,
+        "waiting_poll": 1,
+        "rate_limited": 0,
+        "download_retry": 0,
+    }
+    assert payload["items"][0]["instance_name"] == "East"
+    assert "authorization" not in payload["items"][0]
+    assert payload["errors"][0]["instance_name"] == "West"
+
+
+def test_fleet_credit_refresh_fans_out_and_audits(authenticated, monkeypatch):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        east = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["tokens"],
+        )
+        west = Instance(
+            name="West",
+            base_url="https://west.example",
+            ops_api_version=1,
+            capabilities=["tokens"],
+        )
+        db.add_all([east, west])
+        db.commit()
+
+    calls = []
+
+    async def fake_request(base_url, method, path, **kwargs):
+        calls.append((base_url, method, path, kwargs.get("json")))
+        if "west" in base_url:
+            raise RemoteError("offline")
+        return RemoteResponse(
+            200,
+            {
+                "status": "partial",
+                "total": 3,
+                "refreshed_count": 2,
+                "failed_count": 1,
+            },
+            {},
+        )
+
+    polls = []
+
+    async def fake_poll():
+        polls.append(True)
+
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    response = client.post("/api/fleet/tokens/credits-batch", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "partial"
+    assert payload["summary"] == {
+        "instances": 2,
+        "succeeded_instances": 0,
+        "partial_instances": 1,
+        "failed_instances": 1,
+        "refreshed_count": 2,
+        "failed_count": 1,
+    }
+    assert len(calls) == 2
+    assert all(call[1:] == (
+        "POST",
+        "/api/v1/tokens/credits/refresh-batch",
+        {"ids": None},
+    ) for call in calls)
+    assert polls == [True]
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "fleet.credits_refresh"
+        ).one()
+        assert audit.outcome == "partial"
+        assert audit.detail["refreshed_count"] == 2

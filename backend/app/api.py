@@ -25,12 +25,20 @@ from .models import (
 )
 from .notifications import notification_service
 from .polling import fleet_poller
-from .preferences import get_low_credit_threshold, set_low_credit_threshold
+from .preferences import (
+    get_account_targets,
+    get_low_credit_threshold,
+    set_account_targets,
+    set_low_credit_threshold,
+)
 from .remote import RemoteError, remote_client
 from .schemas import (
     AccountBatchEnabledRequest,
+    AccountMoveRequest,
     AccountBatchRequest,
     AlertRuleUpdate,
+    FleetCookieImportRequest,
+    FleetLowCreditDeleteRequest,
     InstanceCreate,
     InstanceUpdate,
     LoginRequest,
@@ -271,6 +279,7 @@ def dashboard(db: Session = Depends(get_db)):
         },
         "preferences": {
             "low_credit_threshold": get_low_credit_threshold(db),
+            "account_targets": get_account_targets(db),
         },
         "updated_at": time.time(),
     }
@@ -637,6 +646,589 @@ async def instance_accounts(instance_id: str, db: Session = Depends(get_db)):
     }
 
 
+async def _fleet_account_states(
+    instances: list[Instance], threshold: float
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    async def fetch(item: Instance):
+        try:
+            accounts, summary = await _fetch_instance_accounts(item, threshold)
+            try:
+                total = int(summary.get("total"))
+            except (TypeError, ValueError):
+                total = len(accounts)
+            return {
+                "instance": item,
+                "accounts": accounts,
+                "summary": summary,
+                "current_count": max(0, total),
+            }, None
+        except (RemoteError, HTTPException) as exc:
+            return None, {
+                "instance_id": item.id,
+                "instance_name": item.name,
+                "detail": str(exc)[:500],
+            }
+
+    results = await asyncio.gather(*(fetch(item) for item in instances))
+    states = [state for state, error in results if state is not None and error is None]
+    errors = [error for state, error in results if error is not None and state is None]
+    return states, errors
+
+
+def _allocate_fleet_import(
+    items: list[dict[str, Any]], states: list[dict[str, Any]]
+) -> None:
+    for state in states:
+        state["assigned"] = []
+        state["deficit"] = max(
+            0, int(state["target_count"]) - int(state["current_count"])
+        )
+
+    next_item = 0
+    while next_item < len(items):
+        assigned_in_round = False
+        for state in states:
+            if len(state["assigned"]) >= state["deficit"]:
+                continue
+            state["assigned"].append(items[next_item])
+            next_item += 1
+            assigned_in_round = True
+            if next_item >= len(items):
+                break
+        if not assigned_in_round:
+            break
+
+    spill_index = 0
+    while next_item < len(items):
+        states[spill_index % len(states)]["assigned"].append(items[next_item])
+        next_item += 1
+        spill_index += 1
+
+
+def _fleet_preflight_error(errors: list[dict[str, str]]) -> str:
+    summary = "；".join(
+        f'{item["instance_name"]}: {item["detail"]}' for item in errors[:5]
+    )
+    if len(errors) > 5:
+        summary += f"；另有 {len(errors) - 5} 个实例失败"
+    return f"读取实例账号失败，未执行变更：{summary}"
+
+
+@api_router.post("/fleet/accounts/import", dependencies=[Depends(require_csrf)])
+async def import_fleet_accounts(
+    payload: FleetCookieImportRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    target_map: dict[str, int] = {}
+    for target in payload.targets:
+        if target.instance_id in target_map:
+            raise HTTPException(status_code=400, detail="instance targets must be unique")
+        target_map[target.instance_id] = target.target_count
+
+    records = {
+        item.id: item
+        for item in db.scalars(
+            select(Instance).where(Instance.id.in_(list(target_map)))
+        ).all()
+    }
+    missing = [instance_id for instance_id in target_map if instance_id not in records]
+    disabled = [records[value].name for value in target_map if value in records and not records[value].enabled]
+    if missing:
+        raise HTTPException(status_code=404, detail="one or more target instances were not found")
+    if disabled:
+        raise HTTPException(
+            status_code=409,
+            detail=f"target instances are disabled: {', '.join(disabled)}",
+        )
+
+    instances = [records[target.instance_id] for target in payload.targets]
+    for instance in instances:
+        _ensure_compatible(instance, "accounts")
+        _ensure_compatible(instance, "refresh_profiles")
+    states, errors = await _fleet_account_states(
+        instances, get_low_credit_threshold(db)
+    )
+    if errors:
+        _record_audit(
+            db,
+            request=request,
+            instance_id=None,
+            action="fleet.account_import",
+            outcome="failed",
+            started=started,
+            resource_type="fleet_accounts",
+            detail={"item_count": len(payload.items), "preflight_errors": len(errors)},
+        )
+        raise HTTPException(status_code=502, detail=_fleet_preflight_error(errors))
+
+    for state in states:
+        state["target_count"] = target_map[state["instance"].id]
+    items = [item.model_dump(exclude_none=True) for item in payload.items]
+    _allocate_fleet_import(items, states)
+    set_account_targets(db, target_map)
+
+    async def send(state: dict[str, Any]) -> dict[str, Any]:
+        instance: Instance = state["instance"]
+        assigned = state["assigned"]
+        result = {
+            "instance_id": instance.id,
+            "instance_name": instance.name,
+            "before_count": state["current_count"],
+            "target_count": state["target_count"],
+            "deficit": state["deficit"],
+            "assigned_count": len(assigned),
+            "imported_count": 0,
+            "failed_count": 0,
+            "refreshed_count": 0,
+            "refresh_failed_count": 0,
+            "status": "skipped" if not assigned else "pending",
+            "error": "",
+        }
+        if not assigned:
+            return result
+        try:
+            response = await remote_client.request(
+                instance.base_url,
+                "POST",
+                "/api/v1/refresh-profiles/import-cookie-batch",
+                json={"items": assigned},
+                timeout=600,
+            )
+            data = response.data if isinstance(response.data, dict) else {}
+            result.update(
+                {
+                    "imported_count": int(data.get("imported_count") or 0),
+                    "failed_count": int(data.get("failed_count") or 0),
+                    "refreshed_count": int(data.get("refreshed_count") or 0),
+                    "refresh_failed_count": int(
+                        data.get("refresh_failed_count") or 0
+                    ),
+                    "status": str(data.get("status") or "ok"),
+                }
+            )
+        except RemoteError as exc:
+            result["failed_count"] = len(assigned)
+            result["status"] = "failed"
+            result["error"] = str(exc)[:500]
+        return result
+
+    results = await asyncio.gather(*(send(state) for state in states))
+    totals = {
+        "total": len(items),
+        "assigned": sum(item["assigned_count"] for item in results),
+        "imported": sum(item["imported_count"] for item in results),
+        "failed": sum(item["failed_count"] for item in results),
+        "refreshed": sum(item["refreshed_count"] for item in results),
+        "refresh_failed": sum(item["refresh_failed_count"] for item in results),
+    }
+    has_errors = bool(totals["failed"] or totals["refresh_failed"])
+    status = "ok" if not has_errors else ("partial" if totals["imported"] else "failed")
+    _record_audit(
+        db,
+        request=request,
+        instance_id=None,
+        action="fleet.account_import",
+        outcome="success" if status == "ok" else status,
+        started=started,
+        resource_type="fleet_accounts",
+        detail={
+            "item_count": len(items),
+            "instance_count": len(instances),
+            "imported_count": totals["imported"],
+            "failed_count": totals["failed"],
+            "refresh_failed_count": totals["refresh_failed"],
+            "targets": target_map,
+        },
+    )
+    await fleet_poller.run_once()
+    return {"status": status, **totals, "instances": results}
+
+
+@api_router.post(
+    "/fleet/accounts/delete-low-credit", dependencies=[Depends(require_csrf)]
+)
+async def delete_fleet_low_credit_accounts(
+    payload: FleetLowCreditDeleteRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    instances = _selected_instances(db, None)
+    if not instances:
+        raise HTTPException(status_code=409, detail="no enabled instances")
+    for instance in instances:
+        _ensure_compatible(instance, "accounts")
+        _ensure_compatible(instance, "refresh_profiles")
+    states, errors = await _fleet_account_states(
+        instances, payload.credit_threshold
+    )
+    if errors:
+        _record_audit(
+            db,
+            request=request,
+            instance_id=None,
+            action="fleet.low_credit_delete",
+            outcome="failed",
+            started=started,
+            resource_type="fleet_accounts",
+            detail={
+                "credit_threshold": payload.credit_threshold,
+                "preflight_errors": len(errors),
+            },
+        )
+        raise HTTPException(status_code=502, detail=_fleet_preflight_error(errors))
+
+    for state in states:
+        state["matched_ids"] = [
+            account["id"]
+            for account in state["accounts"]
+            if account.get("credits_available") is not None
+            and float(account["credits_available"]) < payload.credit_threshold
+        ]
+
+    async def remove(state: dict[str, Any]) -> dict[str, Any]:
+        instance: Instance = state["instance"]
+        matched_ids = state["matched_ids"]
+        result = {
+            "instance_id": instance.id,
+            "instance_name": instance.name,
+            "matched_count": len(matched_ids),
+            "deleted_count": 0,
+            "missing_count": 0,
+            "status": "skipped" if not matched_ids else "pending",
+            "error": "",
+        }
+        if not matched_ids:
+            return result
+        try:
+            response = await remote_client.request(
+                instance.base_url,
+                "POST",
+                "/api/v1/refresh-profiles/delete-batch",
+                json={"ids": matched_ids},
+                timeout=180,
+            )
+            data = response.data if isinstance(response.data, dict) else {}
+            result.update(
+                {
+                    "deleted_count": int(data.get("deleted_count") or 0),
+                    "missing_count": int(data.get("missing_count") or 0),
+                    "status": str(data.get("status") or "ok"),
+                }
+            )
+        except RemoteError as exc:
+            result["status"] = "failed"
+            result["error"] = str(exc)[:500]
+        return result
+
+    results = await asyncio.gather(*(remove(state) for state in states))
+    matched = sum(item["matched_count"] for item in results)
+    deleted_count = sum(item["deleted_count"] for item in results)
+    missing_count = sum(item["missing_count"] for item in results)
+    failed_instances = sum(1 for item in results if item["status"] == "failed")
+    status = "ok" if not missing_count and not failed_instances else "partial"
+    _record_audit(
+        db,
+        request=request,
+        instance_id=None,
+        action="fleet.low_credit_delete",
+        outcome="success" if status == "ok" else status,
+        started=started,
+        resource_type="fleet_accounts",
+        detail={
+            "credit_threshold": payload.credit_threshold,
+            "matched_count": matched,
+            "deleted_count": deleted_count,
+            "missing_count": missing_count,
+            "failed_instances": failed_instances,
+        },
+    )
+    await fleet_poller.run_once()
+    return {
+        "status": status,
+        "credit_threshold": payload.credit_threshold,
+        "matched_count": matched,
+        "deleted_count": deleted_count,
+        "missing_count": missing_count,
+        "failed_instances": failed_instances,
+        "instances": results,
+    }
+
+
+IMAGE_QUEUE_STATES = {
+    "QUEUED",
+    "UPLOADING",
+    "SUBMITTING",
+    "WAITING_POLL",
+    "RATE_LIMITED",
+    "DOWNLOADING",
+    "DOWNLOAD_RETRY",
+    "COMPLETED",
+    "FAILED",
+}
+
+
+def _queue_number(value: Any, *, integer: bool = False) -> float | int:
+    try:
+        number = max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        number = 0.0
+    return int(number) if integer else round(number, 3)
+
+
+def _queue_state(value: Any) -> str:
+    state = str(value or "QUEUED").strip().upper()
+    return state if state in IMAGE_QUEUE_STATES else "QUEUED"
+
+
+def _safe_queue_output(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "index": _queue_number(value.get("index"), integer=True),
+        "state": _queue_state(value.get("state")),
+        "token_id": str(value.get("token_id") or "")[:80] or None,
+        "account_name": str(value.get("account_name") or "")[:160] or None,
+        "upstream_job_id": str(value.get("upstream_job_id") or "")[:200] or None,
+        "retry_count": _queue_number(value.get("retry_count"), integer=True),
+        "next_run_at": _optional_float(value.get("next_run_at")),
+        "rate_limit_wait_seconds": _queue_number(
+            value.get("rate_limit_wait_seconds")
+        ),
+        "download_attempt": _queue_number(
+            value.get("download_attempt"), integer=True
+        ),
+        "last_error": str(value.get("last_error") or "")[:500] or None,
+        "updated_at": _optional_float(value.get("updated_at")),
+    }
+
+
+def _safe_queue_request(value: Any, instance: Instance) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    request_id = str(value.get("id") or value.get("log_id") or "").strip()
+    if not request_id:
+        return None
+    outputs = [
+        output
+        for output in (
+            _safe_queue_output(raw) for raw in (value.get("outputs") or [])
+        )
+        if output is not None
+    ]
+    return {
+        "id": request_id[:200],
+        "log_id": str(value.get("log_id") or request_id)[:200],
+        "instance_id": instance.id,
+        "instance_name": instance.name,
+        "instance_location": instance.location,
+        "path": str(value.get("path") or "")[:300],
+        "model": str(value.get("model") or "")[:160],
+        "prompt_preview": str(value.get("prompt_preview") or "")[:180],
+        "requested_count": _queue_number(
+            value.get("requested_count"), integer=True
+        ),
+        "completed_count": _queue_number(
+            value.get("completed_count"), integer=True
+        ),
+        "state": _queue_state(value.get("state")),
+        "created_at": _optional_float(value.get("created_at")),
+        "updated_at": _optional_float(value.get("updated_at")),
+        "finished_at": _optional_float(value.get("finished_at")),
+        "elapsed_seconds": _queue_number(value.get("elapsed_seconds")),
+        "error": str(value.get("error") or "")[:1000] or None,
+        "outputs": outputs,
+    }
+
+
+@api_router.get("/image-queue")
+async def aggregate_image_queue(
+    instance_ids: Optional[str] = None,
+    limit_per_instance: int = Query(default=200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    instances = _selected_instances(db, instance_ids)
+
+    async def fetch(item: Instance):
+        try:
+            _ensure_compatible(item, "image_queue")
+            data = await remote_client.image_queue(
+                item.base_url, limit=limit_per_instance
+            )
+            return item, data, None
+        except (RemoteError, HTTPException) as exc:
+            return item, None, str(exc)
+
+    results = await asyncio.gather(*(fetch(item) for item in instances))
+    summary = {
+        "instances": len(instances),
+        "instances_ok": 0,
+        "instances_error": 0,
+        "requests": 0,
+        "outputs": 0,
+        "in_progress": 0,
+        "queued": 0,
+        "waiting_poll": 0,
+        "rate_limited": 0,
+        "download_retry": 0,
+    }
+    items: list[dict[str, Any]] = []
+    instance_rows = []
+    errors = []
+    for instance, data, error in results:
+        if error:
+            summary["instances_error"] += 1
+            detail = str(error)[:500]
+            error_item = {
+                "instance_id": instance.id,
+                "instance_name": instance.name,
+                "detail": detail,
+            }
+            errors.append(error_item)
+            instance_rows.append(
+                {
+                    "instance_id": instance.id,
+                    "instance_name": instance.name,
+                    "state": "error",
+                    "summary": {},
+                    "error": detail,
+                }
+            )
+            continue
+
+        summary["instances_ok"] += 1
+        remote_summary = (
+            data.get("summary") if isinstance(data.get("summary"), dict) else {}
+        )
+        safe_summary = {
+            key: _queue_number(remote_summary.get(key), integer=True)
+            for key in (
+                "requests",
+                "outputs",
+                "in_progress",
+                "queued",
+                "waiting_poll",
+                "rate_limited",
+                "download_retry",
+            )
+        }
+        for key, value in safe_summary.items():
+            summary[key] += value
+        instance_rows.append(
+            {
+                "instance_id": instance.id,
+                "instance_name": instance.name,
+                "state": "ok",
+                "summary": safe_summary,
+                "error": "",
+            }
+        )
+        for raw in data.get("items") or []:
+            safe_item = _safe_queue_request(raw, instance)
+            if safe_item is not None:
+                items.append(safe_item)
+
+    items.sort(
+        key=lambda item: float(item.get("created_at") or 0), reverse=True
+    )
+    return {
+        "status": "partial" if errors else "ok",
+        "summary": summary,
+        "instances": instance_rows,
+        "items": items,
+        "errors": errors,
+        "updated_at": time.time(),
+    }
+
+
+@api_router.post(
+    "/fleet/tokens/credits-batch", dependencies=[Depends(require_csrf)]
+)
+async def refresh_fleet_credits(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    instances = _selected_instances(db, None)
+
+    async def refresh(item: Instance) -> dict[str, Any]:
+        try:
+            _ensure_compatible(item, "tokens")
+            response = await remote_client.request(
+                item.base_url,
+                "POST",
+                "/api/v1/tokens/credits/refresh-batch",
+                json={"ids": None},
+                timeout=180,
+            )
+            data = response.data if isinstance(response.data, dict) else {}
+            failed_count = _queue_number(
+                data.get("failed_count"), integer=True
+            )
+            return {
+                "instance_id": item.id,
+                "instance_name": item.name,
+                "status": "partial" if failed_count else "ok",
+                "total": _queue_number(data.get("total"), integer=True),
+                "refreshed_count": _queue_number(
+                    data.get("refreshed_count"), integer=True
+                ),
+                "failed_count": failed_count,
+                "error": "",
+            }
+        except (RemoteError, HTTPException) as exc:
+            return {
+                "instance_id": item.id,
+                "instance_name": item.name,
+                "status": "failed",
+                "total": 0,
+                "refreshed_count": 0,
+                "failed_count": 0,
+                "error": str(exc)[:500],
+            }
+
+    results = await asyncio.gather(*(refresh(item) for item in instances))
+    refreshed_count = sum(int(item["refreshed_count"]) for item in results)
+    failed_count = sum(int(item["failed_count"]) for item in results)
+    failed_instances = sum(1 for item in results if item["status"] == "failed")
+    partial_instances = sum(1 for item in results if item["status"] == "partial")
+    succeeded_instances = len(results) - failed_instances - partial_instances
+    status = "partial" if failed_instances or partial_instances or failed_count else "ok"
+    _record_audit(
+        db,
+        request=request,
+        instance_id=None,
+        action="fleet.credits_refresh",
+        outcome="success" if status == "ok" else "partial",
+        started=started,
+        resource_type="fleet",
+        detail={
+            "instance_count": len(results),
+            "succeeded_instances": succeeded_instances,
+            "partial_instances": partial_instances,
+            "failed_instances": failed_instances,
+            "refreshed_count": refreshed_count,
+            "failed_count": failed_count,
+        },
+    )
+    if results:
+        await fleet_poller.run_once()
+    return {
+        "status": status,
+        "summary": {
+            "instances": len(results),
+            "succeeded_instances": succeeded_instances,
+            "partial_instances": partial_instances,
+            "failed_instances": failed_instances,
+            "refreshed_count": refreshed_count,
+            "failed_count": failed_count,
+        },
+        "instances": results,
+    }
+
+
 @api_router.get("/tokens")
 async def aggregate_tokens(instance_ids: Optional[str] = None, db: Session = Depends(get_db)):
     instances = _selected_instances(db, instance_ids)
@@ -793,6 +1385,333 @@ async def import_refresh_profile(instance_id: str, request: Request, body: dict 
         db, request, item, action="refresh_profile.import", method="POST", path=path,
         body=body, resource_type="refresh_profile", audit_detail={"count": count}, timeout=120,
     )
+
+
+def _move_import_items(exported: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in exported:
+        cookie_bundle: dict[str, Any] = {"cookie": str(item.get("cookie") or "")}
+        headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
+        session_id = next(
+            (
+                str(value or "").strip()
+                for key, value in headers.items()
+                if str(key or "").strip().lower() == "x-arp-session-id"
+            ),
+            "",
+        )
+        if session_id:
+            cookie_bundle["headers"] = {"x-arp-session-id": session_id}
+        items.append(
+            {
+                "cookie": cookie_bundle,
+                "name": str(item.get("name") or "").strip() or None,
+            }
+        )
+    return items
+
+
+def _confirmed_import_indices(data: dict[str, Any], total: int) -> list[int]:
+    failed_indices = {
+        int(item["index"])
+        for item in (data.get("failed") or [])
+        if isinstance(item, dict)
+        and isinstance(item.get("index"), int)
+        and 0 <= item["index"] < total
+    }
+    try:
+        imported_count = max(0, min(total, int(data.get("imported_count") or 0)))
+    except (TypeError, ValueError):
+        imported_count = 0
+    candidates = [index for index in range(total) if index not in failed_indices]
+    return candidates[:imported_count]
+
+
+def _confirmed_removed_ids(data: dict[str, Any], attempted_ids: list[str]) -> set[str]:
+    attempted = set(attempted_ids)
+    explicit = {
+        str(value or "").strip()
+        for key in ("deleted_ids", "missing_ids")
+        for value in (data.get(key) or [])
+        if str(value or "").strip() in attempted
+    }
+    if explicit:
+        return explicit
+    try:
+        removed_count = int(data.get("deleted_count") or 0) + int(
+            data.get("missing_count") or 0
+        )
+    except (TypeError, ValueError):
+        removed_count = 0
+    if removed_count >= len(attempted_ids) and str(data.get("status") or "") in {
+        "ok",
+        "partial",
+    }:
+        return attempted
+    return set()
+
+
+@api_router.post(
+    "/instances/{instance_id}/refresh-profiles/move",
+    dependencies=[Depends(require_csrf)],
+)
+async def move_refresh_profiles(
+    instance_id: str,
+    payload: AccountMoveRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    source = _get_instance(db, instance_id)
+    target = _get_instance(db, payload.target_instance_id)
+    if source.id == target.id:
+        raise HTTPException(status_code=400, detail="source and target must be different")
+    if not target.enabled:
+        raise HTTPException(status_code=409, detail="target instance is disabled")
+    _ensure_compatible(source, "refresh_profiles")
+    _ensure_compatible(target, "refresh_profiles")
+    ids = list(dict.fromkeys(value.strip() for value in payload.ids if value.strip()))
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+
+    audit_detail: dict[str, Any] = {
+        "source_instance_id": source.id,
+        "source_instance_name": source.name,
+        "target_instance_id": target.id,
+        "target_instance_name": target.name,
+        "requested_count": len(ids),
+    }
+
+    try:
+        export_response = await remote_client.request(
+            source.base_url,
+            "POST",
+            "/api/v1/refresh-profiles/export-cookies",
+            json={"ids": ids},
+            timeout=120,
+        )
+    except RemoteError as exc:
+        audit_detail["failed_stage"] = "export"
+        _record_audit(
+            db,
+            request=request,
+            instance_id=source.id,
+            action="refresh_profile.move_batch",
+            outcome="failed",
+            started=started,
+            resource_type="refresh_profile",
+            detail=audit_detail,
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=f"源实例导出失败（HTTP {exc.status_code}）",
+        ) from exc
+
+    export_data = export_response.data if isinstance(export_response.data, dict) else {}
+    raw_items = export_data.get("items") if isinstance(export_data.get("items"), list) else []
+    exported_by_id = {
+        str(item.get("id") or "").strip(): item
+        for item in raw_items
+        if isinstance(item, dict)
+        and str(item.get("id") or "").strip() in ids
+        and str(item.get("cookie") or "").strip()
+    }
+    exported = [exported_by_id[profile_id] for profile_id in ids if profile_id in exported_by_id]
+    export_missing_count = len(ids) - len(exported)
+    if not exported:
+        audit_detail.update(
+            {"exported_count": 0, "retained_count": len(ids), "failed_stage": "export"}
+        )
+        _record_audit(
+            db,
+            request=request,
+            instance_id=source.id,
+            action="refresh_profile.move_batch",
+            outcome="failed",
+            started=started,
+            resource_type="refresh_profile",
+            detail=audit_detail,
+        )
+        raise HTTPException(status_code=409, detail="源实例未导出任何所选 Cookie 账号")
+
+    try:
+        import_response = await remote_client.request(
+            target.base_url,
+            "POST",
+            "/api/v1/refresh-profiles/import-cookie-batch",
+            json={"items": _move_import_items(exported)},
+            timeout=600,
+        )
+    except RemoteError as exc:
+        audit_detail.update(
+            {
+                "exported_count": len(exported),
+                "retained_count": len(ids),
+                "failed_stage": "import",
+            }
+        )
+        _record_audit(
+            db,
+            request=request,
+            instance_id=source.id,
+            action="refresh_profile.move_batch",
+            outcome="failed",
+            started=started,
+            resource_type="refresh_profile",
+            detail=audit_detail,
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=f"目标实例导入失败，源账号保持不变（HTTP {exc.status_code}）",
+        ) from exc
+
+    import_data = import_response.data if isinstance(import_response.data, dict) else {}
+    imported_indices = _confirmed_import_indices(import_data, len(exported))
+    imported_profiles = (
+        import_data.get("profiles") if isinstance(import_data.get("profiles"), list) else []
+    )
+    confirmed_pairs: list[tuple[int, str]] = []
+    seen_target_ids: set[str] = set()
+    for position, index in enumerate(imported_indices):
+        if position >= len(imported_profiles):
+            break
+        profile = imported_profiles[position]
+        target_profile_id = (
+            str(profile.get("id") or "").strip() if isinstance(profile, dict) else ""
+        )
+        if not target_profile_id or target_profile_id in seen_target_ids:
+            continue
+        seen_target_ids.add(target_profile_id)
+        confirmed_pairs.append((index, target_profile_id))
+    imported_indices = [index for index, _target_id in confirmed_pairs]
+    imported_source_ids = [
+        str(exported[index].get("id") or "") for index in imported_indices
+    ]
+    target_ids_by_source = {
+        str(exported[index].get("id") or ""): target_id
+        for index, target_id in confirmed_pairs
+    }
+
+    removed_source_ids: set[str] = set()
+    source_state_unknown_count = 0
+    if imported_source_ids:
+        try:
+            delete_response = await remote_client.request(
+                source.base_url,
+                "POST",
+                "/api/v1/refresh-profiles/delete-batch",
+                json={"ids": imported_source_ids},
+                timeout=120,
+            )
+            delete_data = (
+                delete_response.data if isinstance(delete_response.data, dict) else {}
+            )
+            removed_source_ids = _confirmed_removed_ids(delete_data, imported_source_ids)
+        except RemoteError:
+            try:
+                source_accounts = await remote_client.accounts(
+                    source.base_url, get_low_credit_threshold(db)
+                )
+                remaining_ids = {
+                    str(item.get("id") or "").strip()
+                    for item in (source_accounts.get("items") or [])
+                    if isinstance(item, dict)
+                }
+                removed_source_ids = {
+                    profile_id
+                    for profile_id in imported_source_ids
+                    if profile_id not in remaining_ids
+                }
+            except (RemoteError, HTTPException):
+                source_state_unknown_count = len(imported_source_ids)
+
+    rollback_source_ids = [
+        profile_id
+        for profile_id in imported_source_ids
+        if profile_id not in removed_source_ids and not source_state_unknown_count
+    ]
+    rollback_target_ids = [
+        target_ids_by_source[profile_id]
+        for profile_id in rollback_source_ids
+        if profile_id in target_ids_by_source
+    ]
+    cleanup_failed_count = len(rollback_source_ids) - len(rollback_target_ids)
+    if rollback_target_ids:
+        try:
+            rollback_response = await remote_client.request(
+                target.base_url,
+                "POST",
+                "/api/v1/refresh-profiles/delete-batch",
+                json={"ids": rollback_target_ids},
+                timeout=120,
+            )
+            rollback_data = (
+                rollback_response.data
+                if isinstance(rollback_response.data, dict)
+                else {}
+            )
+            rolled_back = _confirmed_removed_ids(rollback_data, rollback_target_ids)
+            cleanup_failed_count += len(rollback_target_ids) - len(rolled_back)
+        except RemoteError:
+            cleanup_failed_count += len(rollback_target_ids)
+
+    moved_count = len(removed_source_ids)
+    retained_count = len(ids) - moved_count
+    status = (
+        "ok"
+        if moved_count == len(ids) and not cleanup_failed_count
+        else ("partial" if moved_count else "failed")
+    )
+    try:
+        refresh_failed_count = max(0, int(import_data.get("refresh_failed_count") or 0))
+    except (TypeError, ValueError):
+        refresh_failed_count = 0
+    result = {
+        "status": status,
+        "source": {"id": source.id, "name": source.name},
+        "target": {"id": target.id, "name": target.name},
+        "requested_count": len(ids),
+        "exported_count": len(exported),
+        "imported_count": len(imported_indices),
+        "moved_count": moved_count,
+        "retained_count": retained_count,
+        "export_missing_count": export_missing_count,
+        "import_failed_count": len(exported) - len(imported_indices),
+        "refresh_failed_count": refresh_failed_count,
+        "cleanup_failed_count": cleanup_failed_count,
+        "source_state_unknown_count": source_state_unknown_count,
+    }
+    audit_detail.update(
+        {
+            key: result[key]
+            for key in (
+                "exported_count",
+                "imported_count",
+                "moved_count",
+                "retained_count",
+                "export_missing_count",
+                "import_failed_count",
+                "refresh_failed_count",
+                "cleanup_failed_count",
+                "source_state_unknown_count",
+            )
+        }
+    )
+    _record_audit(
+        db,
+        request=request,
+        instance_id=source.id,
+        action="refresh_profile.move_batch",
+        outcome="success" if status == "ok" else status,
+        started=started,
+        resource_type="refresh_profile",
+        detail=audit_detail,
+    )
+    try:
+        await fleet_poller.run_once()
+    except Exception:
+        pass
+    return result
 
 
 @api_router.post(
@@ -1167,6 +2086,7 @@ def manager_settings(db: Session = Depends(get_db)):
         "event_retention_days": settings.event_retention_days,
         "ops_key_configured": bool(settings.ops_key),
         "low_credit_threshold": get_low_credit_threshold(db),
+        "account_targets": get_account_targets(db),
         **notification_service.status(),
     }
 

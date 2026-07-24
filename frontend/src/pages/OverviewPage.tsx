@@ -1,19 +1,21 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowRight, ChevronDown, Gauge, RefreshCw, Save, Server, Upload, UsersRound, WalletCards } from "lucide-react";
+import { AlertTriangle, ArrowRight, ChevronDown, Gauge, RefreshCw, Save, Server, Trash2, Upload, UsersRound, WalletCards } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { AccountTable } from "../components/AccountTable";
 import { AccountBatchBar } from "../components/AccountBatchBar";
+import { AccountMoveModal } from "../components/AccountMoveModal";
 import { CookieImportModal } from "../components/CookieImportModal";
+import { FleetImportModal, FleetLowCreditDeleteModal } from "../components/FleetAccountActions";
 import { Heartbeat } from "../components/Heartbeat";
 import { StatusBadge } from "../components/StatusBadge";
 import { apiFetch, emitToast, formatDuration, formatNumber, formatTime } from "../lib/api";
-import type { AccountsResponse, FleetInstance } from "../types";
+import type { AccountsResponse, FleetCreditsRefreshResponse, FleetInstance } from "../types";
 
 interface DashboardResponse {
   instances: FleetInstance[];
   summary: { total: number; online: number; offline: number; active_alerts: number };
-  preferences: { low_credit_threshold: number };
+  preferences: { low_credit_threshold: number; account_targets: Record<string, number> };
   updated_at: number;
 }
 
@@ -21,6 +23,8 @@ export function OverviewPage() {
   const queryClient = useQueryClient();
   const [expandedId, setExpandedId] = useState("");
   const [threshold, setThreshold] = useState("100");
+  const [fleetImportOpen, setFleetImportOpen] = useState(false);
+  const [lowCreditDeleteOpen, setLowCreditDeleteOpen] = useState(false);
   const dashboard = useQuery({
     queryKey: ["dashboard"],
     queryFn: () => apiFetch<DashboardResponse>("/dashboard"),
@@ -37,6 +41,22 @@ export function OverviewPage() {
     onSuccess: () => {
       emitToast("采集已完成", "success");
       queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (error) => emitToast(error.message, "error")
+  });
+  const refreshFleetCredits = useMutation({
+    mutationFn: () => apiFetch<FleetCreditsRefreshResponse>("/fleet/tokens/credits-batch", { method: "POST" }),
+    onSuccess: async (payload) => {
+      const summary = payload.summary;
+      emitToast(
+        `额度刷新完成：成功 ${summary.refreshed_count}，失败 ${summary.failed_count}，异常实例 ${summary.failed_instances}`,
+        payload.status === "ok" ? "success" : "info"
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({ queryKey: ["accounts"] }),
+        queryClient.invalidateQueries({ queryKey: ["instance-accounts"] })
+      ]);
     },
     onError: (error) => emitToast(error.message, "error")
   });
@@ -75,7 +95,12 @@ export function OverviewPage() {
   return <div className="page-stack">
     <section className="page-toolbar">
       <div><strong>{data ? `${data.summary.online}/${data.summary.total} 个实例在线` : "正在读取实例状态"}</strong><span>最后采集 {formatTime(data?.updated_at)}</span></div>
-      <button className="secondary-btn" onClick={() => poll.mutate()} disabled={poll.isPending}><RefreshCw size={16} className={poll.isPending ? "spin" : ""} />立即采集</button>
+      <div className="inline-actions">
+        <button className="primary-btn" onClick={() => setFleetImportOpen(true)}><Upload size={16} />统一导入</button>
+        <button className="secondary-btn" onClick={() => refreshFleetCredits.mutate()} disabled={refreshFleetCredits.isPending}><WalletCards size={16} />刷新全部额度</button>
+        <button className="secondary-btn batch-danger" onClick={() => setLowCreditDeleteOpen(true)}><Trash2 size={16} />低积分清理</button>
+        <button className="secondary-btn" onClick={() => poll.mutate()} disabled={poll.isPending}><RefreshCw size={16} className={poll.isPending ? "spin" : ""} />立即采集</button>
+      </div>
     </section>
 
     <section className="metric-band">
@@ -97,28 +122,34 @@ export function OverviewPage() {
         {data?.instances.map((instance) => <OverviewInstanceRow
           key={instance.id}
           instance={instance}
+          instances={data.instances}
           threshold={data.preferences.low_credit_threshold}
           expanded={expandedId === instance.id}
           onToggle={() => setExpandedId((current) => current === instance.id ? "" : instance.id)}
         />)}
       </div>
     </section>
+    <FleetImportModal open={fleetImportOpen} onClose={() => setFleetImportOpen(false)} instances={data?.instances || []} savedTargets={data?.preferences.account_targets || {}} />
+    <FleetLowCreditDeleteModal open={lowCreditDeleteOpen} onClose={() => setLowCreditDeleteOpen(false)} defaultThreshold={data?.preferences.low_credit_threshold ?? 100} />
   </div>;
 }
 
 function OverviewInstanceRow({
   instance,
+  instances,
   threshold,
   expanded,
   onToggle
 }: {
   instance: FleetInstance;
+  instances: FleetInstance[];
   threshold: number;
   expanded: boolean;
   onToggle: () => void;
 }) {
   const queryClient = useQueryClient();
   const [importOpen, setImportOpen] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const supportsAccounts = !instance.capabilities.length || instance.capabilities.includes("accounts");
   const accounts = useQuery({
@@ -139,8 +170,15 @@ function OverviewInstanceRow({
     onError: (error) => emitToast(error.message, "error")
   });
   useEffect(() => {
-    if (!expanded) setSelected(new Set());
+    if (!expanded) {
+      setSelected(new Set());
+      setMoveOpen(false);
+    }
   }, [expanded]);
+
+  const selectedAccounts = (accounts.data?.accounts || []).filter(
+    (item) => selected.has(`${item.instance_id}:${item.id}`)
+  );
 
   const snapshot = instance.snapshot;
   const accountStats = snapshot?.accounts;
@@ -167,10 +205,11 @@ function OverviewInstanceRow({
     </div>
     {expanded && <section className="account-drawer">
       <div className="account-drawer-head"><div><strong>Cookie 账号</strong><span>按剩余积分从低到高</span></div><div className="inline-actions"><button className="secondary-btn compact-action" onClick={() => setImportOpen(true)}><Upload size={15} />导入</button><button className="secondary-btn compact-action" disabled={refreshBalances.isPending} onClick={() => refreshBalances.mutate()}><WalletCards size={15} />刷新余额</button><button className="icon-btn" title="刷新账号列表" onClick={() => accounts.refetch()}><RefreshCw size={16} className={accounts.isFetching ? "spin" : ""} /></button><Link className="text-link" to={`/instances/${instance.id}?tab=accounts`}>完整管理</Link></div></div>
-      <AccountBatchBar accounts={accounts.data?.accounts || []} selected={selected} onSelectionChange={setSelected} compact />
+      <AccountBatchBar accounts={accounts.data?.accounts || []} selected={selected} onSelectionChange={setSelected} onMove={() => setMoveOpen(true)} compact />
       {accounts.isError && <div className="drawer-error">{accounts.error.message}</div>}
       <div className="account-drawer-scroll"><AccountTable accounts={accounts.data?.accounts || []} compact loading={accounts.isLoading} selected={selected} onSelectionChange={setSelected} /></div>
     </section>}
     <CookieImportModal open={importOpen} onClose={() => setImportOpen(false)} fixedInstanceId={instance.id} fixedInstanceName={instance.name} />
+    <AccountMoveModal open={moveOpen} onClose={() => setMoveOpen(false)} source={instance} instances={instances} accounts={selectedAccounts} onMoved={() => { setSelected(new Set()); accounts.refetch(); }} />
   </article>;
 }

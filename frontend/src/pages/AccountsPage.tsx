@@ -5,7 +5,7 @@ import { AccountBatchBar } from "../components/AccountBatchBar";
 import { AccountTable } from "../components/AccountTable";
 import { CookieImportModal } from "../components/CookieImportModal";
 import { apiDownload, apiFetch, emitToast } from "../lib/api";
-import type { AccountsResponse, FleetInstance } from "../types";
+import type { AccountsResponse, FleetCreditsRefreshResponse, FleetInstance } from "../types";
 
 export function AccountsPage({ fixedInstanceId }: { fixedInstanceId?: string }) {
   const queryClient = useQueryClient();
@@ -43,14 +43,22 @@ export function AccountsPage({ fixedInstanceId }: { fixedInstanceId?: string }) 
   const refreshBalances = useMutation({
     mutationFn: () => {
       const targetId = fixedInstanceId || instanceFilter;
-      if (!targetId) throw new Error("请先选择一个实例");
-      return apiFetch(`/instances/${targetId}/tokens/credits-batch`, {
-        method: "POST",
-        body: JSON.stringify({})
-      });
+      return apiFetch<FleetCreditsRefreshResponse | Record<string, unknown>>(
+        targetId ? `/instances/${targetId}/tokens/credits-batch` : "/fleet/tokens/credits-batch",
+        {
+          method: "POST",
+          body: JSON.stringify({})
+        }
+      );
     },
-    onSuccess: async () => {
-      emitToast("账号余额已刷新", "success");
+    onSuccess: async (payload) => {
+      const fleet = "summary" in payload ? payload as FleetCreditsRefreshResponse : null;
+      emitToast(
+        fleet
+          ? `全部实例额度已刷新：成功 ${fleet.summary.refreshed_count}，失败 ${fleet.summary.failed_count}`
+          : "账号余额已刷新",
+        fleet?.status === "partial" ? "info" : "success"
+      );
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["accounts"] }),
         queryClient.invalidateQueries({ queryKey: ["dashboard"] })
@@ -73,7 +81,7 @@ export function AccountsPage({ fixedInstanceId }: { fixedInstanceId?: string }) 
       {!fixedInstanceId && <div><strong>Cookie 账号</strong><span>{rows.length} 条当前结果 · 低积分阈值 {accounts.data?.low_credit_threshold ?? 100}</span></div>}
       <div className="inline-actions">
         <button className="primary-btn" onClick={() => setImportOpen(true)}><Upload size={16} />导入 Cookie</button>
-        <button className="secondary-btn" disabled={!fixedInstanceId && !instanceFilter || refreshBalances.isPending} onClick={() => refreshBalances.mutate()}><WalletCards size={16} />刷新全部余额</button>
+        <button className="secondary-btn" disabled={refreshBalances.isPending} onClick={() => refreshBalances.mutate()}><WalletCards size={16} />{fixedInstanceId || instanceFilter ? "刷新实例额度" : "刷新全部实例额度"}</button>
         <button className="secondary-btn" disabled={!fixedInstanceId && !instanceFilter} onClick={exportCookies}><Download size={16} />导出 Cookie</button>
         <button className="icon-btn" title="刷新账号列表" onClick={() => accounts.refetch()}><RefreshCw size={17} className={accounts.isFetching ? "spin" : ""} /></button>
       </div>

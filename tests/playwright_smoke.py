@@ -75,7 +75,7 @@ def instance(instance_id: str, name: str, location: str, state: str, credits: in
         "last_error": "" if state == "online" else "connection refused",
         "latency_seconds": 0.18,
         "ops_api_version": 1,
-        "capabilities": ["snapshot", "accounts", "refresh_profiles", "config", "cursor_logs"],
+        "capabilities": ["snapshot", "accounts", "refresh_profiles", "config", "cursor_logs", "tokens", "image_queue"],
         "snapshot": snapshot(12, 12, credits, low, success, failed),
         "heartbeat": [{"ts": NOW - index * 3600, "availability": 1 if state == "online" else 0} for index in range(48)],
         "active_alerts": 0 if state == "online" else 1,
@@ -91,6 +91,73 @@ INSTANCES = [
 ]
 
 
+IMAGE_QUEUE = {
+    "status": "partial",
+    "summary": {
+        "instances": 3,
+        "instances_ok": 2,
+        "instances_error": 1,
+        "requests": 2,
+        "outputs": 5,
+        "in_progress": 4,
+        "queued": 1,
+        "waiting_poll": 1,
+        "rate_limited": 1,
+        "download_retry": 1,
+    },
+    "instances": [
+        {"instance_id": "east", "instance_name": "华东节点", "location": "上海", "status": "ok", "requests": 2, "outputs": 5, "in_progress": 4},
+        {"instance_id": "south", "instance_name": "华南节点", "location": "深圳", "status": "ok", "requests": 0, "outputs": 0, "in_progress": 0},
+        {"instance_id": "europe", "instance_name": "欧洲节点", "location": "法兰克福", "status": "error", "requests": 0, "outputs": 0, "in_progress": 0},
+    ],
+    "items": [
+        {
+            "id": "request-east-1",
+            "log_id": "log-image-001",
+            "path": "/v1/images/generations",
+            "model": "gpt-image-2",
+            "prompt_preview": "现代产品摄影，白色背景，清晰展示主体",
+            "requested_count": 3,
+            "completed_count": 1,
+            "state": "RATE_LIMITED",
+            "created_at": NOW - 48,
+            "elapsed_seconds": 48,
+            "error": "",
+            "instance_id": "east",
+            "instance_name": "华东节点",
+            "instance_location": "上海",
+            "outputs": [
+                {"index": 0, "state": "COMPLETED", "account_name": "acc***01", "token_id": "", "upstream_job_id": "job-001", "retry_count": 0, "next_run_at": None, "rate_limit_wait_seconds": 0, "download_attempt": 1, "last_error": ""},
+                {"index": 1, "state": "RATE_LIMITED", "account_name": "acc***02", "token_id": "", "upstream_job_id": "job-002", "retry_count": 2, "next_run_at": NOW + 8, "rate_limit_wait_seconds": 12, "download_attempt": 0, "last_error": "Too many requests"},
+                {"index": 2, "state": "WAITING_POLL", "account_name": "acc***03", "token_id": "", "upstream_job_id": "job-003", "retry_count": 0, "next_run_at": NOW + 3, "rate_limit_wait_seconds": 0, "download_attempt": 0, "last_error": ""},
+            ],
+        },
+        {
+            "id": "request-east-2",
+            "log_id": "log-image-002",
+            "path": "/v1/images/edits",
+            "model": "gpt-image-2",
+            "prompt_preview": "保持人物一致，替换为城市夜景",
+            "requested_count": 2,
+            "completed_count": 0,
+            "state": "DOWNLOAD_RETRY",
+            "created_at": NOW - 22,
+            "elapsed_seconds": 22,
+            "error": "",
+            "instance_id": "east",
+            "instance_name": "华东节点",
+            "instance_location": "上海",
+            "outputs": [
+                {"index": 0, "state": "DOWNLOAD_RETRY", "account_name": "acc***04", "token_id": "", "upstream_job_id": "job-004", "retry_count": 1, "next_run_at": NOW + 4, "rate_limit_wait_seconds": 0, "download_attempt": 2, "last_error": "presigned URL expired"},
+                {"index": 1, "state": "QUEUED", "account_name": "", "token_id": "", "upstream_job_id": "", "retry_count": 0, "next_run_at": NOW + 1, "rate_limit_wait_seconds": 0, "download_attempt": 0, "last_error": ""},
+            ],
+        },
+    ],
+    "errors": [{"instance_id": "europe", "instance_name": "欧洲节点", "detail": "connection refused"}],
+    "updated_at": NOW,
+}
+
+
 def fulfill(route: Route, payload: object, status: int = 200):
     route.fulfill(status=status, content_type="application/json", body=json.dumps(payload, ensure_ascii=False))
 
@@ -101,7 +168,7 @@ def install_routes(page: Page, state: dict):
         rows = json.loads(json.dumps(INSTANCES))
         for row in rows:
             row["snapshot"]["accounts"]["low_credit_threshold"] = threshold
-        fulfill(route, {"instances": rows, "summary": {"total": 3, "online": 2, "offline": 1, "active_alerts": 1}, "preferences": {"low_credit_threshold": threshold}, "updated_at": NOW})
+        fulfill(route, {"instances": rows, "summary": {"total": 3, "online": 2, "offline": 1, "active_alerts": 1}, "preferences": {"low_credit_threshold": threshold, "account_targets": {"east": 14, "south": 12, "europe": 12}}, "updated_at": NOW})
 
     def instance_accounts(route: Route):
         state["account_requests"] += 1
@@ -128,14 +195,107 @@ def install_routes(page: Page, state: dict):
         })
         fulfill(route, {"status": "ok"})
 
+    def move_accounts(route: Route):
+        body = route.request.post_data_json
+        state["moves"].append(body)
+        target = next(item for item in INSTANCES if item["id"] == body["target_instance_id"])
+        count = len(body["ids"])
+        fulfill(route, {
+            "status": "ok",
+            "source": {"id": "east", "name": "华东节点"},
+            "target": {"id": target["id"], "name": target["name"]},
+            "requested_count": count,
+            "exported_count": count,
+            "imported_count": count,
+            "moved_count": count,
+            "retained_count": 0,
+            "export_missing_count": 0,
+            "import_failed_count": 0,
+            "refresh_failed_count": 0,
+            "cleanup_failed_count": 0,
+            "source_state_unknown_count": 0,
+        })
+
+    def fleet_import(route: Route):
+        body = route.request.post_data_json
+        state["fleet_imports"].append(body)
+        assignments = [2, 0, 0]
+        fulfill(route, {
+            "status": "ok",
+            "total": len(body["items"]),
+            "assigned": len(body["items"]),
+            "imported": len(body["items"]),
+            "failed": 0,
+            "refreshed": len(body["items"]),
+            "refresh_failed": 0,
+            "instances": [
+                {
+                    "instance_id": item["id"],
+                    "instance_name": item["name"],
+                    "before_count": 12,
+                    "target_count": next(target["target_count"] for target in body["targets"] if target["instance_id"] == item["id"]),
+                    "deficit": 2 if item["id"] == "east" else 0,
+                    "assigned_count": assignments[index],
+                    "imported_count": assignments[index],
+                    "failed_count": 0,
+                    "refreshed_count": assignments[index],
+                    "refresh_failed_count": 0,
+                    "status": "ok" if assignments[index] else "skipped",
+                    "error": "",
+                }
+                for index, item in enumerate(INSTANCES)
+            ],
+        })
+
+    def fleet_delete(route: Route):
+        body = route.request.post_data_json
+        state["fleet_deletes"].append(body)
+        matched = sum(1 for item in ACCOUNT_ROWS if item["credits_available"] < body["credit_threshold"])
+        fulfill(route, {
+            "status": "ok",
+            "credit_threshold": body["credit_threshold"],
+            "matched_count": matched,
+            "deleted_count": matched,
+            "missing_count": 0,
+            "failed_instances": 0,
+            "instances": [{
+                "instance_id": "east",
+                "instance_name": "华东节点",
+                "matched_count": matched,
+                "deleted_count": matched,
+                "missing_count": 0,
+                "status": "ok",
+                "error": "",
+            }],
+        })
+
+    def fleet_credit_refresh(route: Route):
+        state["fleet_credit_refreshes"].append(route.request.post_data_json or {})
+        fulfill(route, {
+            "status": "partial",
+            "summary": {
+                "instances": 3,
+                "successful_instances": 2,
+                "failed_instances": 1,
+                "refreshed_count": 21,
+                "failed_count": 2,
+            },
+            "instances": [],
+        })
+
     page.route("**/api/dashboard", dashboard_route)
     page.route("**/api/accounts*", all_accounts)
     page.route("**/api/instances/east/accounts", instance_accounts)
     page.route("**/api/settings/preferences", preferences)
+    page.route("**/api/fleet/accounts/import", fleet_import)
+    page.route("**/api/fleet/accounts/delete-low-credit", fleet_delete)
+    page.route("**/api/fleet/tokens/credits-batch", fleet_credit_refresh)
+    page.route("**/api/image-queue?*", lambda route: fulfill(route, IMAGE_QUEUE))
     page.route("**/api/instances/east/refresh-profiles/**", lambda route: fulfill(route, {"status": "ok"}))
     page.route("**/api/instances/east/refresh-profiles/import", import_cookie)
     page.route("**/api/instances/east/refresh-profiles/enabled-batch", batch_action)
     page.route("**/api/instances/east/refresh-profiles/delete-batch", batch_action)
+    page.route("**/api/instances/east/refresh-profiles/move", move_accounts)
     page.route("**/api/instances/east/tokens/credits-batch", lambda route: fulfill(route, {"status": "ok"}))
     page.route("**/api/instances/east/metrics?*", lambda route: fulfill(route, {"items": [{"ts": NOW - 3600, "latency_seconds": 0.2, "error_rate": 0.01, "active_tokens": 12}, {"ts": NOW, "latency_seconds": 0.3, "error_rate": 0.02, "active_tokens": 12}]}))
     page.route("**/api/instances/east", lambda route: fulfill(route, INSTANCES[0]))
@@ -156,7 +316,7 @@ def body_fits_viewport(page: Page) -> bool:
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(headless=True)
-    state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": []}
+    state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
     console_errors = []
     context = browser.new_context(viewport={"width": 1440, "height": 900})
     page = context.new_page()
@@ -168,6 +328,31 @@ with sync_playwright() as playwright:
     assert page.locator(".fleet-row").count() == 3
     assert page.get_by_text("2/3 个实例在线").is_visible()
     assert state["account_requests"] == 0
+
+    page.get_by_role("button", name="刷新全部额度", exact=True).click()
+    page.get_by_text("额度刷新完成：成功 21，失败 2，异常实例 1").wait_for()
+    assert state["fleet_credit_refreshes"] == [{}]
+
+    page.get_by_role("button", name="统一导入").click()
+    fleet_import_dialog = page.get_by_role("dialog", name="统一导入 Cookie 账号")
+    assert fleet_import_dialog.locator(".fleet-target-list label").count() == 3
+    fleet_import_dialog.locator(".cookie-paste").fill('[{"name":"New A","cookie":"sid=a"},{"name":"New B","cookie":"sid=b"}]')
+    fleet_import_dialog.get_by_text("已解析 2 个 Cookie 账号").wait_for()
+    fleet_import_dialog.get_by_role("button", name="分配并导入 2 个账号").click()
+    fleet_import_dialog.get_by_text("导入成功").wait_for()
+    assert len(state["fleet_imports"]) == 1
+    assert state["fleet_imports"][0]["targets"][0] == {"instance_id": "east", "target_count": 14}
+    page.screenshot(path=ARTIFACTS / "fleet-import-desktop.png", full_page=True)
+    fleet_import_dialog.get_by_role("button", name="完成").click()
+
+    page.get_by_role("button", name="低积分清理").click()
+    delete_dialog = page.get_by_role("dialog", name="清理低积分账号")
+    delete_dialog.get_by_text("匹配账号").wait_for()
+    delete_dialog.get_by_role("button", name="删除 3 个账号").click()
+    delete_dialog.get_by_text("已删除").wait_for()
+    assert state["fleet_deletes"] == [{"credit_threshold": 100}]
+    page.screenshot(path=ARTIFACTS / "fleet-delete-desktop.png", full_page=True)
+    delete_dialog.get_by_role("button", name="完成").click()
     east_row = page.locator(".fleet-item").filter(has_text="华东节点")
     assert east_row.locator(".account-count-stat small").get_by_text("低积分 3", exact=True).is_visible()
     east_row.get_by_title("展开账号").click()
@@ -203,6 +388,17 @@ with sync_playwright() as playwright:
     assert state["imports"][-1]["cookie"] == "sid=file-cookie"
     dialog.get_by_role("button", name="完成").click()
 
+    east_row.get_by_label("选择 Adobe Account 01").click()
+    east_row.get_by_label("选择 Adobe Account 02").click()
+    east_row.get_by_role("button", name="批量移动").click()
+    move_dialog = page.get_by_role("dialog", name="批量移动 Cookie 账号")
+    move_dialog.get_by_label("目标实例", exact=True).select_option("south")
+    page.screenshot(path=ARTIFACTS / "account-move-desktop.png", full_page=True)
+    move_dialog.get_by_role("button", name="移动 2 个账号").click()
+    move_dialog.get_by_text("移动完成").wait_for()
+    assert state["moves"] == [{"ids": ["profile-1", "profile-2"], "target_instance_id": "south"}]
+    move_dialog.get_by_role("button", name="完成").click()
+
     page.get_by_role("link", name="Cookie账号", exact=True).click()
     page.get_by_role("heading", name="Cookie 账号").wait_for()
     page.locator(".account-table tbody tr").first.wait_for()
@@ -221,17 +417,34 @@ with sync_playwright() as playwright:
     assert body_fits_viewport(page)
     page.screenshot(path=ARTIFACTS / "accounts-desktop.png", full_page=True)
 
+    page.get_by_role("link", name="图片队列", exact=True).click()
+    page.get_by_text("跨实例图片队列").wait_for()
+    assert page.get_by_text("4", exact=True).first.is_visible()
+    assert page.locator(".manager-queue-title strong").get_by_text("华东节点", exact=True).first.is_visible()
+    assert page.get_by_text("429 等待", exact=True).count() >= 1
+    assert page.locator(".manager-queue-request").count() == 2
+    output_scroll = page.locator(".manager-queue-output-scroll").first.evaluate("el => ({clientWidth: el.clientWidth, scrollWidth: el.scrollWidth})")
+    assert output_scroll["scrollWidth"] >= output_scroll["clientWidth"]
+    assert body_fits_viewport(page)
+    page.screenshot(path=ARTIFACTS / "image-queue-desktop.png", full_page=True)
+
     page.goto(f"{BASE_URL}/instances/east", wait_until="networkidle")
     page.get_by_text("24 小时趋势").wait_for()
     assert page.locator("canvas").count() == 1
     page.screenshot(path=ARTIFACTS / "instance-detail-desktop.png", full_page=True)
 
-    mobile_state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": []}
+    mobile_state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
     mobile = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
     mobile_page = mobile.new_page()
     install_routes(mobile_page, mobile_state)
     mobile_page.on("dialog", lambda dialog: dialog.accept())
     login(mobile_page)
+    mobile_page.get_by_role("button", name="统一导入").click()
+    mobile_import = mobile_page.get_by_role("dialog", name="统一导入 Cookie 账号")
+    assert mobile_import.locator(".fleet-target-list label").count() == 3
+    assert body_fits_viewport(mobile_page)
+    mobile_page.screenshot(path=ARTIFACTS / "fleet-import-mobile.png", full_page=True)
+    mobile_import.get_by_title("关闭").click()
     mobile_east = mobile_page.locator(".fleet-item").filter(has_text="华东节点")
     assert mobile_state["account_requests"] == 0
     mobile_east.get_by_title("展开账号").click()
@@ -242,20 +455,39 @@ with sync_playwright() as playwright:
     assert mobile_drawer["scrollHeight"] > mobile_drawer["clientHeight"]
     assert body_fits_viewport(mobile_page)
     mobile_page.screenshot(path=ARTIFACTS / "overview-mobile-expanded.png", full_page=True)
+    mobile_east.get_by_label("选择 Adobe Account 01").click()
+    mobile_east.get_by_label("选择 Adobe Account 02").click()
+    mobile_east.get_by_role("button", name="批量移动").click()
+    mobile_move = mobile_page.get_by_role("dialog", name="批量移动 Cookie 账号")
+    mobile_move.get_by_label("目标实例", exact=True).select_option("south")
+    assert body_fits_viewport(mobile_page)
+    mobile_page.screenshot(path=ARTIFACTS / "account-move-mobile.png", full_page=True)
+    mobile_move.get_by_title("关闭").click()
     mobile_page.get_by_title("打开导航").click()
     assert mobile_page.locator(".sidebar-open").is_visible()
     mobile_page.screenshot(path=ARTIFACTS / "navigation-mobile.png", full_page=True)
+    mobile_page.get_by_role("link", name="图片队列", exact=True).click()
+    mobile_page.get_by_text("跨实例图片队列").wait_for()
+    mobile_page.wait_for_timeout(350)
+    assert not mobile_page.locator(".sidebar-open").is_visible()
+    mobile_output_scroll = mobile_page.locator(".manager-queue-output-scroll").first.evaluate("el => ({clientWidth: el.clientWidth, scrollWidth: el.scrollWidth})")
+    assert mobile_output_scroll["scrollWidth"] > mobile_output_scroll["clientWidth"]
+    assert body_fits_viewport(mobile_page)
+    mobile_page.screenshot(path=ARTIFACTS / "image-queue-mobile.png", full_page=True)
 
     result = {
         "initial_account_requests": 0,
         "expanded_account_requests": 1,
         "desktop_drawer": drawer_size,
         "mobile_drawer": mobile_drawer,
+        "desktop_queue_scroll": output_scroll,
+        "mobile_queue_scroll": mobile_output_scroll,
         "desktop_overflow": not body_fits_viewport(page),
         "mobile_overflow": not body_fits_viewport(mobile_page),
         "console_errors": console_errors,
         "imports": len(state["imports"]),
         "batch_actions": len(state["batch_actions"]),
+        "moves": len(state["moves"]),
         "screenshots": sorted(path.name for path in ARTIFACTS.glob("*.png")),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
