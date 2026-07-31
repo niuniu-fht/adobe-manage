@@ -10,12 +10,14 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from .alerts import seed_alert_rules
-from .api import api_router, auth_router
+from .auto_replacements import auto_replacement_service
+from .api import api_router, auth_router, integration_router
 from .config import BASE_DIR, settings
 from .database import SessionLocal, create_schema, migrate_schema
 from .polling import fleet_poller
 from .preferences import seed_manager_settings
 from .remote import remote_client
+from .taem import taem_client
 
 
 @asynccontextmanager
@@ -27,12 +29,15 @@ async def lifespan(_app: FastAPI):
     with SessionLocal() as db:
         seed_alert_rules(db)
         seed_manager_settings(db)
+    auto_replacement_service.start()
     fleet_poller.start()
     try:
         yield
     finally:
         await fleet_poller.stop()
+        await auto_replacement_service.stop()
         await remote_client.close()
+        await taem_client.close()
 
 
 app = FastAPI(title="Adobe2API Manager", version="1.0.0", lifespan=lifespan)
@@ -68,10 +73,14 @@ def health():
         "status": "ok",
         "access_key_configured": bool(settings.access_key),
         "ops_key_configured": bool(settings.ops_key),
+        "taem_configured": bool(
+            settings.taem_api_url and settings.taem_username and settings.taem_password
+        ),
     }
 
 
 app.include_router(auth_router)
+app.include_router(integration_router)
 app.include_router(api_router)
 
 frontend_dist = BASE_DIR / "frontend" / "dist"

@@ -81,6 +81,18 @@ class AccountMoveRequest(AccountBatchRequest):
     target_instance_id: str = Field(min_length=1, max_length=100)
 
 
+class AccountSafeReplaceRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if "@" not in normalized:
+            raise ValueError("email must be a valid account email")
+        return normalized
+
+
 class FleetAccountTarget(BaseModel):
     instance_id: str = Field(min_length=1, max_length=100)
     target_count: int = Field(ge=0, le=1_000_000)

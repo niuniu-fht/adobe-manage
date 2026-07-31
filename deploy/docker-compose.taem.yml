@@ -1,0 +1,10 @@
+services:
+  manager:
+    networks:
+      - default
+      - taem
+
+networks:
+  taem:
+    external: true
+    name: ${TAEM_DOCKER_NETWORK:-taem-compose_default}

@@ -1,6 +1,46 @@
 from app.database import SessionLocal
 from app.models import AuditEvent, Instance
 from app.remote import RemoteError, RemoteResponse, remote_client
+from app.taem import TaemError, taem_client
+
+
+def test_dashboard_aggregates_today_success_and_in_progress(authenticated):
+    client, _headers = authenticated
+    with SessionLocal() as db:
+        db.add_all(
+            [
+                Instance(
+                    name="East",
+                    base_url="https://east.example",
+                    state="online",
+                    last_snapshot={
+                        "requests": {
+                            "successful": 99,
+                            "in_progress": 2,
+                            "today": {"successful": 12},
+                        }
+                    },
+                ),
+                Instance(
+                    name="West",
+                    base_url="https://west.example",
+                    state="online",
+                    last_snapshot={
+                        "requests": {
+                            "successful": 7,
+                            "in_progress": 3,
+                        }
+                    },
+                ),
+            ]
+        )
+        db.commit()
+
+    response = client.get("/api/dashboard")
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["total_success"] == 19
+    assert response.json()["summary"]["total_in_progress"] == 5
 
 
 def test_login_and_csrf_protect_mutations(client):
@@ -205,6 +245,44 @@ def test_account_aggregation_returns_partial_for_legacy_instance(authenticated, 
     assert response.json()["errors"][0]["instance_name"] == "Legacy"
 
 
+def test_integration_accounts_requires_ops_key_and_returns_all_accounts(
+    client, monkeypatch
+):
+    with SessionLocal() as db:
+        instance = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["accounts"],
+        )
+        db.add(instance)
+        db.commit()
+
+    async def fake_accounts(_base_url, _threshold):
+        return {
+            "items": [
+                {
+                    "id": "profile-a",
+                    "email": "member@example.com",
+                    "health": "healthy",
+                    "credits_available": 100,
+                }
+            ],
+            "summary": {"total": 1},
+        }
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    rejected = client.get("/api/integration/accounts")
+    accepted = client.get(
+        "/api/integration/accounts",
+        headers={"X-Adobe2API-Ops-Key": "manager-test-ops"},
+    )
+
+    assert rejected.status_code == 401
+    assert accepted.status_code == 200
+    assert accepted.json()["accounts"][0]["email"] == "member@example.com"
+
+
 def test_low_credit_preference_is_persisted_audited_and_repolled(
     authenticated, monkeypatch
 ):
@@ -287,6 +365,401 @@ def test_account_batch_actions_are_grouped_per_instance_and_audited(
         ).all()
         assert [audit.detail["count"] for audit in audits] == [2, 2]
         assert "profile-a" not in str([audit.detail for audit in audits])
+
+
+def test_account_safe_replace_imports_new_cookie_then_deletes_old_profile(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        instance = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["accounts", "refresh_profiles"],
+        )
+        db.add(instance)
+        db.commit()
+        instance_id = instance.id
+
+    secret = "SECRET_REPLACEMENT_COOKIE"
+    calls = []
+
+    async def fake_replace(email):
+        assert email == "old@example.com"
+        return {
+            "source_email": email,
+            "replacement_email": "new@example.com",
+            "cookie": secret,
+        }
+
+    async def fake_accounts(_base_url, _low_credit_threshold):
+        return {
+            "items": [{"id": "profile-old", "email": "", "name": "old@example.com"}],
+            "summary": {"total": 1},
+        }
+
+    async def fake_request(base_url, method, path, **kwargs):
+        calls.append((base_url, method, path, kwargs.get("json")))
+        if path.endswith("import-cookie-batch"):
+            assert kwargs["json"] == {
+                "items": [
+                    {
+                        "cookie": {"cookie": secret},
+                        "name": "new@example.com",
+                    }
+                ]
+            }
+            return RemoteResponse(
+                200,
+                {
+                    "status": "ok",
+                    "imported_count": 1,
+                    "failed_count": 0,
+                    "refreshed_count": 1,
+                    "refresh_failed_count": 0,
+                    "profiles": [{"id": "profile-new"}],
+                    "failed": [],
+                },
+                {},
+            )
+        assert path.endswith("delete-batch")
+        assert kwargs["json"] == {"ids": ["profile-old"]}
+        return RemoteResponse(
+            200,
+            {
+                "status": "ok",
+                "deleted_count": 1,
+                "missing_count": 0,
+                "deleted_ids": ["profile-old"],
+                "missing_ids": [],
+            },
+            {},
+        )
+
+    async def fake_poll():
+        return None
+
+    monkeypatch.setattr(taem_client, "replace_member", fake_replace)
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    response = client.post(
+        f"/api/instances/{instance_id}/refresh-profiles/profile-old/replace-safe",
+        headers=headers,
+        json={"email": "OLD@Example.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "message": "已完成移除、安全补号和 Cookie 回写",
+        "source_email": "old@example.com",
+        "replacement_email": "new@example.com",
+        "replacement_profile_id": "profile-new",
+        "imported_count": 1,
+        "refresh_failed_count": 0,
+        "old_profile_removed": True,
+    }
+    assert [call[2] for call in calls] == [
+        "/api/v1/refresh-profiles/import-cookie-batch",
+        "/api/v1/refresh-profiles/delete-batch",
+    ]
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "refresh_profile.replace_safe"
+        ).one()
+        assert audit.outcome == "success"
+        assert audit.detail["old_profile_removed"] is True
+        assert secret not in str(audit.detail)
+
+
+def test_account_safe_replace_surfaces_taem_error_without_touching_instance(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        instance = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        db.add(instance)
+        db.commit()
+        instance_id = instance.id
+
+    async def fake_replace(_email):
+        raise TaemError("母号尚未取得管理权限，请先登录", status_code=400)
+
+    async def fake_accounts(_base_url, _low_credit_threshold):
+        return {
+            "items": [{"id": "profile-old", "email": "old@example.com"}],
+            "summary": {"total": 1},
+        }
+
+    remote_calls = []
+
+    async def fake_request(*args, **kwargs):
+        remote_calls.append((args, kwargs))
+        return RemoteResponse(200, {}, {})
+
+    monkeypatch.setattr(taem_client, "replace_member", fake_replace)
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    response = client.post(
+        f"/api/instances/{instance_id}/refresh-profiles/profile-old/replace-safe",
+        headers=headers,
+        json={"email": "old@example.com"},
+    )
+
+    assert response.status_code == 400
+    assert "母号尚未取得管理权限" in response.json()["detail"]
+    assert remote_calls == []
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "refresh_profile.replace_safe"
+        ).one()
+        assert audit.outcome == "failed"
+        assert audit.detail["failed_stage"] == "taem"
+
+
+def test_account_safe_replace_keeps_old_profile_when_new_cookie_import_fails(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        instance = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        db.add(instance)
+        db.commit()
+        instance_id = instance.id
+
+    async def fake_replace(_email):
+        return {
+            "replacement_email": "new@example.com",
+            "cookie": "SECRET_REPLACEMENT_COOKIE",
+        }
+
+    async def fake_accounts(_base_url, _low_credit_threshold):
+        return {
+            "items": [{"id": "profile-old", "email": "old@example.com"}],
+            "summary": {"total": 1},
+        }
+
+    paths = []
+
+    async def fake_request(_base_url, _method, path, **_kwargs):
+        paths.append(path)
+        raise RemoteError("instance offline", status_code=502)
+
+    monkeypatch.setattr(taem_client, "replace_member", fake_replace)
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    response = client.post(
+        f"/api/instances/{instance_id}/refresh-profiles/profile-old/replace-safe",
+        headers=headers,
+        json={"email": "old@example.com"},
+    )
+
+    assert response.status_code == 502
+    assert "母号已完成移除和补号" in response.json()["detail"]
+    assert "旧 Cookie 账号仍保留" in response.json()["detail"]
+    assert paths == ["/api/v1/refresh-profiles/import-cookie-batch"]
+
+
+def test_account_safe_replace_job_streams_logs_then_imports_once(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        instance = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        db.add(instance)
+        db.commit()
+        instance_id = instance.id
+
+    secret = "SECRET_STREAMED_REPLACEMENT_COOKIE"
+    paths = []
+
+    async def fake_accounts(_base_url, _low_credit_threshold):
+        return {"items": [{"id": "profile-old", "email": "old@example.com"}]}
+
+    async def fake_start(email):
+        assert email == "old@example.com"
+        return {
+            "id": 41,
+            "status": "running",
+            "target": 1,
+            "success": 0,
+            "fail": 0,
+            "log_total": 1,
+            "logs": ["10:00:00 已定位母号"],
+        }
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        assert job_id == 41
+        assert log_offset == 1
+        return {
+            "id": 41,
+            "status": "done",
+            "target": 1,
+            "success": 1,
+            "fail": 0,
+            "log_total": 3,
+            "logs": ["10:00:01 已移除旧子号", "10:00:02 已安全补入新子号"],
+            "result": {
+                "replacement": {"email": "new@example.com", "cookie": secret}
+            },
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        paths.append(path)
+        if path.endswith("import-cookie-batch"):
+            assert kwargs["json"]["items"][0]["cookie"]["cookie"] == secret
+            return RemoteResponse(
+                200,
+                {
+                    "imported_count": 1,
+                    "refresh_failed_count": 0,
+                    "profiles": [{"id": "profile-new"}],
+                    "failed": [],
+                },
+                {},
+            )
+        return RemoteResponse(
+            200,
+            {"deleted_count": 1, "deleted_ids": ["profile-old"]},
+            {},
+        )
+
+    async def fake_poll():
+        return None
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_replace_member", fake_start)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+
+    started = client.post(
+        f"/api/instances/{instance_id}/refresh-profiles/profile-old/replace-safe/start",
+        headers=headers,
+        json={"email": "old@example.com"},
+    )
+    assert started.status_code == 200
+    operation = started.json()
+    assert operation["status"] == "running"
+    assert operation["upstream_job_id"] == 41
+    assert "已定位母号" in " ".join(operation["logs"])
+
+    completed = client.post(
+        f"/api/safe-replacements/{operation['id']}/poll", headers=headers
+    )
+    assert completed.status_code == 200
+    payload = completed.json()
+    assert payload["status"] == "done"
+    assert payload["phase"] == "complete"
+    assert payload["result"]["replacement_email"] == "new@example.com"
+    assert payload["result"]["old_profile_removed"] is True
+    assert secret not in str(payload)
+    assert paths == [
+        "/api/v1/refresh-profiles/import-cookie-batch",
+        "/api/v1/refresh-profiles/delete-batch",
+    ]
+
+    repeated = client.post(
+        f"/api/safe-replacements/{operation['id']}/poll", headers=headers
+    )
+    assert repeated.status_code == 200
+    assert paths == [
+        "/api/v1/refresh-profiles/import-cookie-batch",
+        "/api/v1/refresh-profiles/delete-batch",
+    ]
+
+
+def test_account_safe_replace_job_can_be_cancelled(authenticated, monkeypatch):
+    client, headers = authenticated
+    with SessionLocal() as db:
+        instance = Instance(
+            name="East",
+            base_url="https://east.example",
+            ops_api_version=1,
+            capabilities=["refresh_profiles"],
+        )
+        db.add(instance)
+        db.commit()
+        instance_id = instance.id
+
+    cancelled = []
+    remote_calls = []
+
+    async def fake_accounts(_base_url, _low_credit_threshold):
+        return {"items": [{"id": "profile-old", "email": "old@example.com"}]}
+
+    async def fake_start(_email):
+        return {"id": 88, "status": "running", "target": 1, "logs": []}
+
+    async def fake_cancel(job_id):
+        cancelled.append(job_id)
+        return {"success": True, "message": "已请求停止拉号"}
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        assert job_id == 88
+        assert log_offset == 0
+        return {
+            "id": 88,
+            "status": "cancelled",
+            "target": 1,
+            "success": 0,
+            "fail": 0,
+            "log_total": 1,
+            "logs": ["10:00:03 已停止"],
+        }
+
+    async def fake_request(*args, **kwargs):
+        remote_calls.append((args, kwargs))
+        return RemoteResponse(200, {}, {})
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_replace_member", fake_start)
+    monkeypatch.setattr(taem_client, "cancel_job", fake_cancel)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+
+    started = client.post(
+        f"/api/instances/{instance_id}/refresh-profiles/profile-old/replace-safe/start",
+        headers=headers,
+        json={"email": "old@example.com"},
+    ).json()
+    stop = client.post(
+        f"/api/safe-replacements/{started['id']}/cancel", headers=headers
+    )
+    assert stop.status_code == 200
+    assert stop.json()["cancel_requested"] is True
+    assert stop.json()["can_cancel"] is False
+    assert cancelled == [88]
+
+    polled = client.post(
+        f"/api/safe-replacements/{started['id']}/poll", headers=headers
+    )
+    assert polled.status_code == 200
+    assert polled.json()["status"] == "cancelled"
+    assert "已停止" in " ".join(polled.json()["logs"])
+    assert remote_calls == []
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "refresh_profile.replace_safe"
+        ).one()
+        assert audit.outcome == "cancelled"
 
 
 def test_account_move_imports_target_before_deleting_source_and_preserves_headers(

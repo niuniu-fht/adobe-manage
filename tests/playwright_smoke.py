@@ -52,7 +52,7 @@ def snapshot(accounts_total: int, available: int, credits: int, low: int, succes
         "ops_api_version": 1,
         "measured_at": NOW,
         "instance": {"service": "adobe2api", "version": "0.2.0", "build_sha": "abc123", "started_at": NOW - 3600, "uptime_seconds": 3600},
-        "requests": {"total": 20, "successful": success, "failed": failed, "error_rate": failed / 20, "duration_p50_seconds": 0.2, "duration_p95_seconds": 0.8, "in_progress": 1, "generated_images": 10, "generated_videos": 2, "today": {"total": success + failed, "successful": success, "failed": failed, "generated_images": 10, "generated_videos": 2}},
+        "requests": {"total": 20, "successful": success, "failed": failed, "error_rate": failed / 20, "duration_p50_seconds": 0.2, "duration_p95_seconds": 0.8, "in_progress": 1, "generated_images": 10, "generated_videos": 2, "today": {"total": success + failed, "successful": success, "failed": failed, "generated_images": 10, "generated_videos": 2, "safety_review_failed": max(0, failed - 2)}},
         "tokens": {"total": accounts_total, "active": available, "status_counts": {"active": available}, "expiring_24h": 0, "credits_total": accounts_total * 2500, "credits_available": credits},
         "accounts": {"total": accounts_total, "available": available, "low_credit": low, "balance_unknown": 0, "refresh_failing": 0, "credential_error": 0, "credits_available": credits, "credits_total": accounts_total * 2500, "low_credit_threshold": 100},
         "refresh_profiles": {"total": accounts_total, "failing": 0, "consecutive_failures_max": 0},
@@ -157,6 +157,36 @@ IMAGE_QUEUE = {
     "updated_at": NOW,
 }
 
+AUTO_REPLACEMENTS = {
+    "active_id": "auto-op-1",
+    "active": True,
+    "queued": 1,
+    "operations": [
+        {
+            "id": "auto-op-1",
+            "instance_id": "east",
+            "instance_name": "华东节点",
+            "profile_id": "profile-1",
+            "source_email": "account01@example.com",
+            "trigger": "积分为 0",
+            "credits_available": 0,
+            "health": "low_credit",
+            "status": "running",
+            "phase": "mother_replacement",
+            "upstream_job_id": 73,
+            "logs": [
+                "10:20:01 实例本地账号已移除，开始调用母号一次性域名补号",
+                "10:20:02 已从母号 Adobe 团队远端移除原子号",
+                "10:20:03 等待 5 秒后开始域名补号",
+            ],
+            "error": "",
+            "replacement_email": "",
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+    ],
+}
+
 
 def fulfill(route: Route, payload: object, status: int = 200):
     route.fulfill(status=status, content_type="application/json", body=json.dumps(payload, ensure_ascii=False))
@@ -168,7 +198,7 @@ def install_routes(page: Page, state: dict):
         rows = json.loads(json.dumps(INSTANCES))
         for row in rows:
             row["snapshot"]["accounts"]["low_credit_threshold"] = threshold
-        fulfill(route, {"instances": rows, "summary": {"total": 3, "online": 2, "offline": 1, "active_alerts": 1}, "preferences": {"low_credit_threshold": threshold, "account_targets": {"east": 14, "south": 12, "europe": 12}}, "updated_at": NOW})
+        fulfill(route, {"instances": rows, "summary": {"total": 3, "online": 2, "offline": 1, "active_alerts": 1, "total_success": 782, "total_in_progress": 3}, "preferences": {"low_credit_threshold": threshold, "account_targets": {"east": 14, "south": 12, "europe": 12}}, "updated_at": NOW})
 
     def instance_accounts(route: Route):
         state["account_requests"] += 1
@@ -215,6 +245,64 @@ def install_routes(page: Page, state: dict):
             "cleanup_failed_count": 0,
             "source_state_unknown_count": 0,
         })
+
+    def safe_replace_operation(status: str = "running"):
+        done = status == "done"
+        cancelled = status == "cancelled"
+        return {
+            "id": "safe-operation-1",
+            "status": status,
+            "phase": "complete" if done else "pulling",
+            "upstream_job_id": 27,
+            "target": 1,
+            "success": 1 if done else 0,
+            "fail": 0,
+            "logs": [
+                "10:24:01 已定位母号并确认管理权限",
+                "10:24:02 已移除旧子号",
+                "10:24:03 正在等待安全补号",
+            ] + (["10:24:04 已停止拉号，未执行 Cookie 回写"] if cancelled else []),
+            "error": "拉号任务已停止" if cancelled else "",
+            "result": {
+                "status": "ok",
+                "message": "已完成移除、安全补号和 Cookie 回写",
+                "source_email": state.get("safe_replace_email", "account01@example.com"),
+                "replacement_email": "replacement@example.com",
+                "replacement_profile_id": "profile-new",
+                "imported_count": 1,
+                "refresh_failed_count": 0,
+                "old_profile_removed": True,
+            } if done else None,
+            "created_at": NOW,
+            "updated_at": NOW + state.get("safe_replace_polls", 0),
+            "can_cancel": status == "running" and not state.get("safe_replace_cancelled"),
+            "cancel_requested": bool(state.get("safe_replace_cancelled")),
+        }
+
+    def safe_replace_start(route: Route):
+        body = route.request.post_data_json
+        state["safe_replaces"].append(body)
+        if state.get("safe_replace_error"):
+            fulfill(route, {"detail": "母号移除并安全补号失败：母号尚未取得管理权限，请先登录"}, status=400)
+            return
+        state["safe_replace_email"] = body["email"]
+        state["safe_replace_polls"] = 0
+        state["safe_replace_cancelled"] = False
+        fulfill(route, safe_replace_operation())
+
+    def safe_replace_poll(route: Route):
+        state["safe_replace_polls"] += 1
+        if state.get("safe_replace_cancelled"):
+            fulfill(route, safe_replace_operation("cancelled"))
+        elif state.get("hold_safe_replace") or state["safe_replace_polls"] == 1:
+            fulfill(route, safe_replace_operation())
+        else:
+            fulfill(route, safe_replace_operation("done"))
+
+    def safe_replace_cancel(route: Route):
+        state["safe_replace_cancelled"] = True
+        state["safe_replace_cancels"] += 1
+        fulfill(route, safe_replace_operation())
 
     def fleet_import(route: Route):
         body = route.request.post_data_json
@@ -284,6 +372,7 @@ def install_routes(page: Page, state: dict):
         })
 
     page.route("**/api/dashboard", dashboard_route)
+    page.route("**/api/auto-replacements", lambda route: fulfill(route, AUTO_REPLACEMENTS))
     page.route("**/api/accounts*", all_accounts)
     page.route("**/api/instances/east/accounts", instance_accounts)
     page.route("**/api/settings/preferences", preferences)
@@ -296,6 +385,9 @@ def install_routes(page: Page, state: dict):
     page.route("**/api/instances/east/refresh-profiles/enabled-batch", batch_action)
     page.route("**/api/instances/east/refresh-profiles/delete-batch", batch_action)
     page.route("**/api/instances/east/refresh-profiles/move", move_accounts)
+    page.route("**/api/instances/east/refresh-profiles/*/replace-safe/start", safe_replace_start)
+    page.route("**/api/safe-replacements/*/poll", safe_replace_poll)
+    page.route("**/api/safe-replacements/*/cancel", safe_replace_cancel)
     page.route("**/api/instances/east/tokens/credits-batch", lambda route: fulfill(route, {"status": "ok"}))
     page.route("**/api/instances/east/metrics?*", lambda route: fulfill(route, {"items": [{"ts": NOW - 3600, "latency_seconds": 0.2, "error_rate": 0.01, "active_tokens": 12}, {"ts": NOW, "latency_seconds": 0.3, "error_rate": 0.02, "active_tokens": 12}]}))
     page.route("**/api/instances/east", lambda route: fulfill(route, INSTANCES[0]))
@@ -316,7 +408,7 @@ def body_fits_viewport(page: Page) -> bool:
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(headless=True)
-    state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
+    state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "safe_replaces": [], "safe_replace_error": False, "safe_replace_polls": 0, "safe_replace_cancels": 0, "safe_replace_cancelled": False, "hold_safe_replace": False, "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
     console_errors = []
     context = browser.new_context(viewport={"width": 1440, "height": 900})
     page = context.new_page()
@@ -327,7 +419,14 @@ with sync_playwright() as playwright:
 
     assert page.locator(".fleet-row").count() == 3
     assert page.get_by_text("2/3 个实例在线").is_visible()
+    assert page.locator(".metric-band").get_by_text("总成功数", exact=True).is_visible()
+    assert page.locator(".metric-band").get_by_text("782", exact=True).is_visible()
+    assert page.locator(".metric-band").get_by_text("总进行中数", exact=True).is_visible()
+    assert page.get_by_label("自动移除补号控制台").is_visible()
+    assert page.get_by_label("自动移除补号控制台").get_by_text("等待 5 秒后开始域名补号", exact=False).is_visible()
     assert state["account_requests"] == 0
+    assert body_fits_viewport(page)
+    page.screenshot(path=ARTIFACTS / "overview-stats-desktop.png", full_page=True)
 
     page.get_by_role("button", name="刷新全部额度", exact=True).click()
     page.get_by_text("额度刷新完成：成功 21，失败 2，异常实例 1").wait_for()
@@ -355,8 +454,9 @@ with sync_playwright() as playwright:
     delete_dialog.get_by_role("button", name="完成").click()
     east_row = page.locator(".fleet-item").filter(has_text="华东节点")
     assert east_row.locator(".account-count-stat small").get_by_text("低积分 3", exact=True).is_visible()
+    assert east_row.locator(".fleet-stat").filter(has_text="审核失败").get_by_text("13", exact=True).is_visible()
     east_row.get_by_title("展开账号").click()
-    east_row.locator(".account-table tbody tr").first.wait_for()
+    east_row.get_by_text("Adobe Account 01", exact=True).wait_for()
     assert state["account_requests"] == 1
     assert east_row.locator(".account-table tbody tr").count() == 12
     assert east_row.locator(".account-table tbody tr").first.locator("td").nth(3).get_by_text("5", exact=True).is_visible()
@@ -401,7 +501,7 @@ with sync_playwright() as playwright:
 
     page.get_by_role("link", name="Cookie账号", exact=True).click()
     page.get_by_role("heading", name="Cookie 账号").wait_for()
-    page.locator(".account-table tbody tr").first.wait_for()
+    page.get_by_text("Adobe Account 01", exact=True).wait_for()
     assert page.locator(".account-table tbody tr").count() == 12
     page.get_by_label("选择 Adobe Account 01").click()
     page.get_by_label("选择 Adobe Account 02").click()
@@ -414,6 +514,45 @@ with sync_playwright() as playwright:
     page.get_by_role("button", name="批量删除").click()
     page.get_by_text("已批量删除 2 个账号").wait_for()
     assert state["batch_actions"][-1]["body"] == {"ids": ["profile-1", "profile-2"]}
+
+    first_account_row = page.locator(".account-table tbody tr").first
+    first_account_row.get_by_title("移除并安全补号").click()
+    replace_dialog = page.get_by_role("dialog", name="移除并安全补号", exact=True)
+    assert replace_dialog.get_by_text("account01@example.com", exact=True).is_visible()
+    assert replace_dialog.get_by_text("华东节点", exact=True).is_visible()
+    page.screenshot(path=ARTIFACTS / "account-safe-replace-confirm-desktop.png", full_page=True)
+    replace_dialog.get_by_role("button", name="移除并安全补号", exact=True).click()
+    replace_dialog.get_by_text("已移除旧子号", exact=False).wait_for()
+    assert replace_dialog.get_by_role("button", name="停止拉号", exact=True).is_visible()
+    page.screenshot(path=ARTIFACTS / "account-safe-replace-progress-desktop.png", full_page=True)
+    replace_dialog.get_by_text("replacement@example.com", exact=True).wait_for()
+    assert state["safe_replaces"][-1] == {"email": "account01@example.com"}
+    page.screenshot(path=ARTIFACTS / "account-safe-replace-success-desktop.png", full_page=True)
+    replace_dialog.get_by_role("button", name="确认").click()
+
+    state["hold_safe_replace"] = True
+    page.locator(".account-table tbody tr").nth(2).get_by_title("移除并安全补号").click()
+    stopped_replace_dialog = page.get_by_role("dialog", name="移除并安全补号", exact=True)
+    stopped_replace_dialog.get_by_role("button", name="移除并安全补号", exact=True).click()
+    stopped_replace_dialog.get_by_text("已移除旧子号", exact=False).wait_for()
+    stopped_replace_dialog.get_by_role("button", name="停止拉号", exact=True).click()
+    stopped_dialog = page.get_by_role("dialog", name="拉号任务已停止")
+    stopped_dialog.get_by_text("未执行 Cookie 回写", exact=False).wait_for()
+    assert state["safe_replace_cancels"] == 1
+    page.screenshot(path=ARTIFACTS / "account-safe-replace-stopped-desktop.png", full_page=True)
+    stopped_dialog.get_by_role("button", name="确认").click()
+    state["hold_safe_replace"] = False
+
+    state["safe_replace_error"] = True
+    page.locator(".account-table tbody tr").nth(1).get_by_title("移除并安全补号").click()
+    failed_replace_dialog = page.get_by_role("dialog", name="移除并安全补号", exact=True)
+    failed_replace_dialog.get_by_role("button", name="移除并安全补号", exact=True).click()
+    error_dialog = page.get_by_role("dialog", name="移除并安全补号出现错误")
+    error_dialog.get_by_text("母号尚未取得管理权限", exact=False).wait_for()
+    assert error_dialog.get_by_role("button", name="确认").is_visible()
+    page.screenshot(path=ARTIFACTS / "account-safe-replace-error-desktop.png", full_page=True)
+    error_dialog.get_by_role("button", name="确认").click()
+    state["safe_replace_error"] = False
     assert body_fits_viewport(page)
     page.screenshot(path=ARTIFACTS / "accounts-desktop.png", full_page=True)
 
@@ -433,12 +572,23 @@ with sync_playwright() as playwright:
     assert page.locator("canvas").count() == 1
     page.screenshot(path=ARTIFACTS / "instance-detail-desktop.png", full_page=True)
 
-    mobile_state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
-    mobile = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+    mobile_state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "safe_replaces": [], "safe_replace_error": False, "safe_replace_polls": 0, "safe_replace_cancels": 0, "safe_replace_cancelled": False, "hold_safe_replace": False, "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
+    mobile = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        is_mobile=True,
+        has_touch=True,
+        storage_state=context.storage_state(),
+    )
     mobile_page = mobile.new_page()
     install_routes(mobile_page, mobile_state)
     mobile_page.on("dialog", lambda dialog: dialog.accept())
-    login(mobile_page)
+    mobile_page.goto(BASE_URL, wait_until="networkidle")
+    mobile_page.get_by_role("heading", name="运行总览").wait_for()
+    assert mobile_page.locator(".metric-band").get_by_text("总成功数", exact=True).is_visible()
+    assert mobile_page.get_by_label("自动移除补号控制台").is_visible()
+    assert mobile_page.locator(".fleet-item").filter(has_text="华东节点").locator(".fleet-mobile-counts span").filter(has_text="审核失败").is_visible()
+    assert body_fits_viewport(mobile_page)
+    mobile_page.screenshot(path=ARTIFACTS / "overview-stats-mobile.png", full_page=True)
     mobile_page.get_by_role("button", name="统一导入").click()
     mobile_import = mobile_page.get_by_role("dialog", name="统一导入 Cookie 账号")
     assert mobile_import.locator(".fleet-target-list label").count() == 3
@@ -448,7 +598,7 @@ with sync_playwright() as playwright:
     mobile_east = mobile_page.locator(".fleet-item").filter(has_text="华东节点")
     assert mobile_state["account_requests"] == 0
     mobile_east.get_by_title("展开账号").click()
-    mobile_east.locator(".account-table tbody tr").first.wait_for()
+    mobile_east.get_by_text("Adobe Account 01", exact=True).wait_for()
     mobile_drawer = mobile_east.locator(".account-drawer-scroll").evaluate("el => ({clientHeight: el.clientHeight, scrollHeight: el.scrollHeight})")
     assert mobile_state["account_requests"] == 1
     assert mobile_drawer["clientHeight"] <= 220
@@ -463,6 +613,22 @@ with sync_playwright() as playwright:
     assert body_fits_viewport(mobile_page)
     mobile_page.screenshot(path=ARTIFACTS / "account-move-mobile.png", full_page=True)
     mobile_move.get_by_title("关闭").click()
+    mobile_page.get_by_title("打开导航").click()
+    mobile_page.get_by_role("link", name="Cookie账号", exact=True).click()
+    mobile_page.get_by_text("Adobe Account 01", exact=True).wait_for()
+    mobile_page.locator(".account-table tbody tr").first.get_by_title("移除并安全补号").click()
+    mobile_replace = mobile_page.get_by_role("dialog", name="移除并安全补号", exact=True)
+    assert mobile_replace.get_by_role("button", name="移除并安全补号", exact=True).is_visible()
+    assert body_fits_viewport(mobile_page)
+    mobile_page.screenshot(path=ARTIFACTS / "account-safe-replace-mobile.png", full_page=True)
+    mobile_state["hold_safe_replace"] = True
+    mobile_replace.get_by_role("button", name="移除并安全补号", exact=True).click()
+    mobile_replace.get_by_text("已移除旧子号", exact=False).wait_for()
+    assert body_fits_viewport(mobile_page)
+    mobile_page.screenshot(path=ARTIFACTS / "account-safe-replace-progress-mobile.png", full_page=True)
+    mobile_replace.get_by_role("button", name="停止拉号", exact=True).click()
+    mobile_page.get_by_role("dialog", name="拉号任务已停止").get_by_text("未执行 Cookie 回写", exact=False).wait_for()
+    mobile_page.get_by_role("dialog", name="拉号任务已停止").get_by_role("button", name="确认").click()
     mobile_page.get_by_title("打开导航").click()
     assert mobile_page.locator(".sidebar-open").is_visible()
     mobile_page.screenshot(path=ARTIFACTS / "navigation-mobile.png", full_page=True)
@@ -488,6 +654,7 @@ with sync_playwright() as playwright:
         "imports": len(state["imports"]),
         "batch_actions": len(state["batch_actions"]),
         "moves": len(state["moves"]),
+        "safe_replaces": len(state["safe_replaces"]),
         "screenshots": sorted(path.name for path in ARTIFACTS.glob("*.png")),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))

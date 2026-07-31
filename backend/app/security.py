@@ -44,6 +44,13 @@ def require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
 
+def require_ops_key(request: Request) -> None:
+    expected = str(settings.ops_key or "")
+    provided = str(request.headers.get("x-adobe2api-ops-key") or "")
+    if not expected or not provided or not hmac.compare_digest(expected, provided):
+        raise HTTPException(status_code=401, detail="Invalid operations key")
+
+
 def require_csrf(request: Request) -> None:
     require_auth(request)
     expected = str((request.session or {}).get("csrf_token") or "")

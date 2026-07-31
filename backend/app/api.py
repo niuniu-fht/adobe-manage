@@ -3,7 +3,7 @@ import base64
 import json
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .alerts import seed_alert_rules
+from .auto_replacements import auto_replacement_service
 from .config import settings
 from .database import get_db
 from .models import (
@@ -32,10 +33,13 @@ from .preferences import (
     set_low_credit_threshold,
 )
 from .remote import RemoteError, remote_client
+from .replacement_coordinator import replacement_coordinator
+from .safe_replacements import TERMINAL_STATUSES, safe_replacement_operations
 from .schemas import (
     AccountBatchEnabledRequest,
     AccountMoveRequest,
     AccountBatchRequest,
+    AccountSafeReplaceRequest,
     AlertRuleUpdate,
     FleetCookieImportRequest,
     FleetLowCreditDeleteRequest,
@@ -50,12 +54,18 @@ from .security import (
     create_session,
     require_auth,
     require_csrf,
+    require_ops_key,
     verify_access_key,
 )
+from .taem import TaemError, taem_client
 
 
 auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 api_router = APIRouter(prefix="/api", dependencies=[Depends(require_auth)])
+integration_router = APIRouter(
+    prefix="/api/integration",
+    dependencies=[Depends(require_ops_key)],
+)
 
 
 def _request_id(request: Request) -> str:
@@ -249,6 +259,8 @@ def dashboard(db: Session = Depends(get_db)):
         hour = int(sample.ts // 3600) * 3600
         buckets.setdefault(sample.instance_id, {}).setdefault(hour, []).append(sample.online)
     payload = []
+    total_success = 0
+    total_in_progress = 0
     for instance in instances:
         heartbeat = []
         instance_buckets = buckets.get(instance.id, {})
@@ -268,6 +280,22 @@ def dashboard(db: Session = Depends(get_db)):
         row["active_alerts"] = sum(
             1 for alert in active_alerts if alert.instance_id == instance.id
         )
+        snapshot = instance.last_snapshot if isinstance(instance.last_snapshot, dict) else {}
+        request_stats = snapshot.get("requests") if isinstance(snapshot, dict) else {}
+        request_stats = request_stats if isinstance(request_stats, dict) else {}
+        today_stats = request_stats.get("today")
+        today_stats = today_stats if isinstance(today_stats, dict) else {}
+        success_value = today_stats.get("successful")
+        if success_value is None:
+            success_value = request_stats.get("successful")
+        try:
+            total_success += max(0, int(success_value or 0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            total_in_progress += max(0, int(request_stats.get("in_progress") or 0))
+        except (TypeError, ValueError):
+            pass
         payload.append(row)
     return {
         "instances": payload,
@@ -276,6 +304,8 @@ def dashboard(db: Session = Depends(get_db)):
             "online": sum(1 for item in instances if item.state == "online"),
             "offline": sum(1 for item in instances if item.state == "offline"),
             "active_alerts": len(active_alerts),
+            "total_success": total_success,
+            "total_in_progress": total_in_progress,
         },
         "preferences": {
             "low_credit_threshold": get_low_credit_threshold(db),
@@ -627,6 +657,17 @@ async def aggregate_accounts(
         "instance_summaries": summaries,
         "errors": errors,
     }
+
+
+@api_router.get("/auto-replacements")
+def auto_replacements():
+    return auto_replacement_service.snapshot()
+
+
+@integration_router.get("/accounts")
+async def integration_accounts(db: Session = Depends(get_db)):
+    """Return the fleet account inventory for the mother-account service."""
+    return await aggregate_accounts(None, db)
 
 
 @api_router.get("/instances/{instance_id}/accounts")
@@ -1385,6 +1426,517 @@ async def import_refresh_profile(instance_id: str, request: Request, body: dict 
         db, request, item, action="refresh_profile.import", method="POST", path=path,
         body=body, resource_type="refresh_profile", audit_detail={"count": count}, timeout=120,
     )
+
+
+@api_router.post(
+    "/instances/{instance_id}/refresh-profiles/{profile_id}/replace-safe",
+    dependencies=[Depends(require_csrf)],
+)
+async def replace_refresh_profile_safely(
+    instance_id: str,
+    profile_id: str,
+    payload: AccountSafeReplaceRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    instance = await _safe_replace_preflight(
+        instance_id, profile_id, payload.email, request, db, started
+    )
+    lock_owner = f"manual-sync:{_request_id(request)}"
+    if not replacement_coordinator.try_acquire(lock_owner):
+        raise HTTPException(
+            status_code=409,
+            detail="已有移除补号流程运行中，请等待控制台任务结束",
+        )
+    try:
+        try:
+            replacement = await taem_client.replace_member(payload.email)
+        except TaemError as exc:
+            _record_safe_replace_failure(
+                db, request, instance, profile_id, started, "taem", str(exc)
+            )
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"母号移除并安全补号失败：{exc}",
+            ) from exc
+        return await _finalize_safe_replacement(
+            instance=instance,
+            profile_id=profile_id,
+            source_email=payload.email,
+            replacement=replacement,
+            request=request,
+            db=db,
+            started=started,
+        )
+    finally:
+        replacement_coordinator.release(lock_owner)
+
+
+def _release_safe_replacement_lock(operation) -> None:
+    if operation.status in TERMINAL_STATUSES and operation.lock_owner:
+        replacement_coordinator.release(operation.lock_owner)
+        operation.lock_owner = ""
+
+
+def _record_safe_replace_failure(
+    db: Session,
+    request: Request,
+    instance: Instance,
+    profile_id: str,
+    started: float,
+    stage: str,
+    error: str,
+) -> None:
+    _record_audit(
+        db,
+        request=request,
+        instance_id=instance.id,
+        action="refresh_profile.replace_safe",
+        outcome="failed",
+        started=started,
+        resource_type="refresh_profile",
+        resource_id=profile_id,
+        detail={"failed_stage": stage, "error": str(error)[:300]},
+    )
+
+
+async def _safe_replace_preflight(
+    instance_id: str,
+    profile_id: str,
+    source_email: str,
+    request: Request,
+    db: Session,
+    started: float,
+) -> Instance:
+    instance = _get_instance(db, instance_id)
+    _ensure_compatible(instance, "refresh_profiles")
+    try:
+        accounts_data = await remote_client.accounts(
+            instance.base_url, get_low_credit_threshold(db)
+        )
+    except RemoteError as exc:
+        _record_safe_replace_failure(
+            db, request, instance, profile_id, started, "preflight", str(exc)
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=f"读取 Adobe 实例账号失败，未执行母号变更：{exc}",
+        ) from exc
+
+    source_profile = next(
+        (
+            item
+            for item in (accounts_data.get("items") or [])
+            if isinstance(item, dict)
+            and str(item.get("id") or "").strip() == profile_id
+        ),
+        None,
+    )
+    source_profile_email = ""
+    if isinstance(source_profile, dict):
+        source_profile_email = str(source_profile.get("email") or "").strip().lower()
+        source_profile_name = str(source_profile.get("name") or "").strip().lower()
+        if not source_profile_email and "@" in source_profile_name:
+            source_profile_email = source_profile_name
+    if not source_profile_email or source_profile_email != source_email:
+        detail = (
+            "所选 Cookie 账号已不存在，请刷新列表后重试"
+            if source_profile is None
+            else "所选 Cookie 账号邮箱已变化，请刷新列表后重试"
+        )
+        _record_safe_replace_failure(
+            db, request, instance, profile_id, started, "preflight", detail
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    return instance
+
+
+async def _finalize_safe_replacement(
+    *,
+    instance: Instance,
+    profile_id: str,
+    source_email: str,
+    replacement: dict[str, Any],
+    request: Request,
+    db: Session,
+    started: float,
+    phase_update: Optional[Callable[[str, str], None]] = None,
+) -> dict[str, Any]:
+    audit_detail: dict[str, Any] = {"failed_stage": ""}
+    cookie = str(replacement.get("cookie") or "").strip()
+    replacement_email = str(replacement.get("replacement_email") or "").strip().lower()
+    if not cookie:
+        detail = "母号补号流程结束，但未返回新 Cookie"
+        _record_safe_replace_failure(
+            db, request, instance, profile_id, started, "taem", detail
+        )
+        raise HTTPException(status_code=502, detail=detail)
+    if phase_update:
+        phase_update("importing", "母号流程已完成，开始将新 Cookie 回写 Adobe 实例")
+    try:
+        import_response = await remote_client.request(
+            instance.base_url,
+            "POST",
+            "/api/v1/refresh-profiles/import-cookie-batch",
+            json={
+                "items": [
+                    {
+                        "cookie": {"cookie": cookie},
+                        "name": replacement_email or source_email,
+                    }
+                ]
+            },
+            timeout=600,
+        )
+    except RemoteError as exc:
+        _record_safe_replace_failure(
+            db, request, instance, profile_id, started, "import", str(exc)
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=(
+                "母号已完成移除和补号，但新 Cookie 导入 Adobe 实例失败；"
+                f"旧 Cookie 账号仍保留：{exc}"
+            ),
+        ) from exc
+
+    import_data = import_response.data if isinstance(import_response.data, dict) else {}
+    imported = bool(_confirmed_import_indices(import_data, 1))
+    if not imported:
+        failed_items = import_data.get("failed") if isinstance(import_data.get("failed"), list) else []
+        failed_detail = next(
+            (
+                str(item.get("detail") or "").strip()
+                for item in failed_items
+                if isinstance(item, dict) and str(item.get("detail") or "").strip()
+            ),
+            "实例未确认导入结果",
+        )
+        _record_safe_replace_failure(
+            db, request, instance, profile_id, started, "import", failed_detail
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "母号已完成移除和补号，但新 Cookie 导入 Adobe 实例失败；"
+                f"旧 Cookie 账号仍保留：{failed_detail}"
+            ),
+        )
+
+    imported_profiles = (
+        import_data.get("profiles") if isinstance(import_data.get("profiles"), list) else []
+    )
+    replacement_profile_id = next(
+        (
+            str(item.get("id") or "").strip()
+            for item in imported_profiles
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ),
+        "",
+    )
+    try:
+        refresh_failed_count = max(0, int(import_data.get("refresh_failed_count") or 0))
+    except (TypeError, ValueError):
+        refresh_failed_count = 0
+    if phase_update:
+        phase_update("cleanup", "新 Cookie 已导入，开始确认并清理旧 Cookie 账号")
+
+    old_profile_removed = False
+    cleanup_error = ""
+    if not replacement_profile_id:
+        cleanup_error = "实例未返回新账号 ID，已保留旧 Cookie 账号"
+    elif replacement_profile_id == profile_id:
+        old_profile_removed = True
+    else:
+        try:
+            delete_response = await remote_client.request(
+                instance.base_url,
+                "POST",
+                "/api/v1/refresh-profiles/delete-batch",
+                json={"ids": [profile_id]},
+                timeout=120,
+            )
+            delete_data = (
+                delete_response.data if isinstance(delete_response.data, dict) else {}
+            )
+            old_profile_removed = profile_id in _confirmed_removed_ids(
+                delete_data, [profile_id]
+            )
+            if not old_profile_removed:
+                cleanup_error = "实例未确认旧 Cookie 账号已清理"
+        except RemoteError as exc:
+            cleanup_error = f"旧 Cookie 账号清理失败：{exc}"
+
+    issues = []
+    if refresh_failed_count:
+        issues.append("新 Cookie 已导入，但首次刷新失败")
+    if cleanup_error:
+        issues.append(cleanup_error)
+    result_status = "partial" if issues else "ok"
+    message = "；".join(issues) if issues else "已完成移除、安全补号和 Cookie 回写"
+    audit_detail.update(
+        {
+            "failed_stage": "cleanup" if cleanup_error else ("refresh" if refresh_failed_count else ""),
+            "imported_count": 1,
+            "refresh_failed_count": refresh_failed_count,
+            "old_profile_removed": old_profile_removed,
+        }
+    )
+    _record_audit(
+        db,
+        request=request,
+        instance_id=instance.id,
+        action="refresh_profile.replace_safe",
+        outcome="success" if result_status == "ok" else "partial",
+        started=started,
+        resource_type="refresh_profile",
+        resource_id=profile_id,
+        detail=audit_detail,
+    )
+    try:
+        await fleet_poller.run_once()
+    except Exception:
+        pass
+    return {
+        "status": result_status,
+        "message": message,
+        "source_email": source_email,
+        "replacement_email": replacement_email,
+        "replacement_profile_id": replacement_profile_id,
+        "imported_count": 1,
+        "refresh_failed_count": refresh_failed_count,
+        "old_profile_removed": old_profile_removed,
+    }
+
+
+@api_router.post(
+    "/instances/{instance_id}/refresh-profiles/{profile_id}/replace-safe/start",
+    dependencies=[Depends(require_csrf)],
+)
+async def start_safe_replacement(
+    instance_id: str,
+    profile_id: str,
+    payload: AccountSafeReplaceRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    existing = safe_replacement_operations.find_active(instance_id, profile_id)
+    if existing:
+        if existing.source_email != payload.email:
+            raise HTTPException(status_code=409, detail="该账号已有另一个补号流程正在运行")
+        return existing.snapshot()
+
+    started = time.perf_counter()
+    instance = await _safe_replace_preflight(
+        instance_id, profile_id, payload.email, request, db, started
+    )
+    operation = safe_replacement_operations.create(
+        instance_id=instance.id,
+        instance_name=instance.name,
+        profile_id=profile_id,
+        source_email=payload.email,
+        request_id=_request_id(request),
+    )
+    operation.lock_owner = f"manual:{operation.id}"
+    if not replacement_coordinator.try_acquire(operation.lock_owner):
+        operation.status = "failed"
+        operation.phase = "failed"
+        operation.error = "已有移除补号流程运行中"
+        operation.add_log(operation.error)
+        _release_safe_replacement_lock(operation)
+        raise HTTPException(
+            status_code=409,
+            detail="已有移除补号流程运行中，请等待控制台任务结束",
+        )
+    operation.started_at = started
+    operation.add_log(f"已确认目标账号 {payload.email}，正在连接母号系统")
+    try:
+        upstream = await taem_client.start_replace_member(payload.email)
+        operation.upstream_job_id = int(upstream.get("id"))
+    except (TaemError, TypeError, ValueError) as exc:
+        status_code = exc.status_code if isinstance(exc, TaemError) else 502
+        operation.status = "failed"
+        operation.error = str(exc)
+        operation.add_log(f"启动母号任务失败：{exc}")
+        _record_safe_replace_failure(
+            db, request, instance, profile_id, started, "taem", str(exc)
+        )
+        _release_safe_replacement_lock(operation)
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    operation.status = "running"
+    operation.phase = "pulling"
+    operation.target = max(1, int(upstream.get("target") or 1))
+    operation.success = max(0, int(upstream.get("success") or 0))
+    operation.fail = max(0, int(upstream.get("fail") or 0))
+    upstream_logs = upstream.get("logs") if isinstance(upstream.get("logs"), list) else []
+    for line in upstream_logs:
+        operation.add_log(str(line))
+    operation.upstream_log_offset = max(
+        len(upstream_logs), int(upstream.get("log_total") or 0)
+    )
+    operation.add_log(f"母号任务 #{operation.upstream_job_id} 已启动")
+    return operation.snapshot()
+
+
+@api_router.post(
+    "/safe-replacements/{operation_id}/poll",
+    dependencies=[Depends(require_csrf)],
+)
+async def poll_safe_replacement(
+    operation_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    operation = safe_replacement_operations.get(operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="补号流程不存在或 Manager 已重启")
+    if operation.status in TERMINAL_STATUSES:
+        _release_safe_replacement_lock(operation)
+        return operation.snapshot()
+    if not safe_replacement_operations.begin_poll(operation):
+        return operation.snapshot()
+
+    try:
+        if operation.upstream_job_id is None:
+            return operation.snapshot()
+        try:
+            upstream = await taem_client.get_job(
+                operation.upstream_job_id,
+                log_offset=operation.upstream_log_offset,
+            )
+        except TaemError as exc:
+            operation.status = "failed"
+            operation.error = str(exc)
+            operation.add_log(f"读取母号任务失败：{exc}")
+            instance = _get_instance(db, operation.instance_id)
+            _record_safe_replace_failure(
+                db,
+                request,
+                instance,
+                operation.profile_id,
+                operation.started_at,
+                "taem",
+                str(exc),
+            )
+            return operation.snapshot()
+
+        upstream_logs = upstream.get("logs") if isinstance(upstream.get("logs"), list) else []
+        for line in upstream_logs:
+            operation.add_log(str(line))
+        operation.upstream_log_offset = max(
+            operation.upstream_log_offset + len(upstream_logs),
+            int(upstream.get("log_total") or 0),
+        )
+        operation.target = max(1, int(upstream.get("target") or operation.target))
+        operation.success = max(0, int(upstream.get("success") or 0))
+        operation.fail = max(0, int(upstream.get("fail") or 0))
+        upstream_status = str(upstream.get("status") or "running")
+        if upstream_status == "running":
+            return operation.snapshot()
+
+        instance = _get_instance(db, operation.instance_id)
+        if upstream_status == "cancelled":
+            operation.status = "cancelled"
+            operation.error = "拉号任务已停止"
+            operation.add_log("母号系统已停止本次拉号，未执行 Cookie 回写")
+            _record_audit(
+                db,
+                request=request,
+                instance_id=instance.id,
+                action="refresh_profile.replace_safe",
+                outcome="cancelled",
+                started=operation.started_at,
+                resource_type="refresh_profile",
+                resource_id=operation.profile_id,
+                detail={"failed_stage": "taem", "cancelled": True},
+            )
+            return operation.snapshot()
+        if upstream_status != "done":
+            error = str(upstream.get("error") or f"母号任务状态：{upstream_status}")
+            operation.status = "failed"
+            operation.error = error
+            operation.add_log(f"母号任务结束：{error}")
+            _record_safe_replace_failure(
+                db,
+                request,
+                instance,
+                operation.profile_id,
+                operation.started_at,
+                "taem",
+                error,
+            )
+            return operation.snapshot()
+
+        upstream_result = (
+            upstream.get("result") if isinstance(upstream.get("result"), dict) else {}
+        )
+        replacement = (
+            upstream_result.get("replacement")
+            if isinstance(upstream_result.get("replacement"), dict)
+            else {}
+        )
+        normalized_replacement = {
+            "cookie": str(replacement.get("cookie") or ""),
+            "replacement_email": str(replacement.get("email") or ""),
+        }
+        operation.status = "finalizing"
+        operation.phase = "importing"
+
+        def update_phase(phase: str, message: str) -> None:
+            operation.phase = phase
+            operation.add_log(message)
+
+        try:
+            result = await _finalize_safe_replacement(
+                instance=instance,
+                profile_id=operation.profile_id,
+                source_email=operation.source_email,
+                replacement=normalized_replacement,
+                request=request,
+                db=db,
+                started=operation.started_at,
+                phase_update=update_phase,
+            )
+        except HTTPException as exc:
+            operation.status = "failed"
+            operation.error = str(exc.detail)
+            operation.add_log(str(exc.detail))
+            return operation.snapshot()
+
+        operation.result = result
+        operation.status = "done" if result.get("status") == "ok" else "partial"
+        operation.phase = "complete"
+        operation.success = 1
+        operation.add_log(str(result.get("message") or "移除并安全补号已完成"))
+        return operation.snapshot()
+    finally:
+        safe_replacement_operations.end_poll(operation)
+        _release_safe_replacement_lock(operation)
+
+
+@api_router.post(
+    "/safe-replacements/{operation_id}/cancel",
+    dependencies=[Depends(require_csrf)],
+)
+async def cancel_safe_replacement(operation_id: str):
+    operation = safe_replacement_operations.get(operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="补号流程不存在或 Manager 已重启")
+    if operation.status in TERMINAL_STATUSES:
+        return operation.snapshot()
+    if operation.phase not in {"starting", "pulling"}:
+        raise HTTPException(status_code=409, detail="母号拉号已完成，正在回写 Cookie")
+    if operation.upstream_job_id is None:
+        raise HTTPException(status_code=409, detail="母号任务正在启动，请稍后停止")
+    try:
+        response = await taem_client.cancel_job(operation.upstream_job_id)
+    except TaemError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    operation.cancel_requested = True
+    operation.add_log(str(response.get("message") or "已请求停止拉号"))
+    return operation.snapshot()
 
 
 def _move_import_items(exported: list[dict[str, Any]]) -> list[dict[str, Any]]:

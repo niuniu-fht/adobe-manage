@@ -1,9 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { CirclePause, CirclePlay, RefreshCw, Trash2 } from "lucide-react";
+import { CirclePause, CirclePlay, RefreshCw, Trash2, UserRoundCog } from "lucide-react";
 import { useState } from "react";
 import { apiFetch, emitToast, formatNumber, formatTime } from "../lib/api";
 import type { AccountItem } from "../types";
 import { AccountHealthBadge } from "./AccountHealthBadge";
+import { AccountSafeReplaceModal } from "./AccountSafeReplaceModal";
 
 export function AccountTable({
   accounts,
@@ -20,6 +21,7 @@ export function AccountTable({
 }) {
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState("");
+  const [replaceTarget, setReplaceTarget] = useState<AccountItem | null>(null);
   const selectable = Boolean(selected && onSelectionChange);
   const accountKey = (item: AccountItem) => `${item.instance_id}:${item.id}`;
   const allSelected = Boolean(
@@ -74,7 +76,7 @@ export function AccountTable({
     );
   }
 
-  return (
+  return <>
     <table className={compact ? "account-table account-table-compact" : "account-table"}>
       <thead><tr>
         {selectable && <th className="selection-cell"><input type="checkbox" aria-label="选择当前账号列表" checked={allSelected} onChange={toggleAll} /></th>}
@@ -100,6 +102,7 @@ export function AccountTable({
             <td>{formatTime(item.credential_expires_at)}</td>
             <td className="truncate-cell" title={item.last_error}>{item.last_error || "-"}</td>
             <td><div className="row-actions">
+              {!compact && <button className="icon-btn safe-replace-icon" title="移除并安全补号" onClick={() => setReplaceTarget(item)}><UserRoundCog size={16} /></button>}
               <button className="icon-btn" title="立即刷新账号" disabled={busy === refreshKey} onClick={() => run(item, "refresh", `/instances/${item.instance_id}/refresh-profiles/${item.id}/refresh`, "POST", "账号已刷新")}><RefreshCw size={16} className={busy === refreshKey ? "spin" : ""} /></button>
               <button className="icon-btn" title={item.enabled ? "暂停自动刷新" : "启用自动刷新"} disabled={busy === enabledKey} onClick={() => run(item, "enabled", `/instances/${item.instance_id}/refresh-profiles/${item.id}/enabled?enabled=${!item.enabled}`, "PUT", item.enabled ? "自动刷新已暂停" : "自动刷新已启用")}>{item.enabled ? <CirclePause size={16} /> : <CirclePlay size={16} />}</button>
               {!compact && <button className="icon-btn danger-icon" title="删除 Cookie 账号" disabled={busy === deleteKey} onClick={() => remove(item)}><Trash2 size={16} /></button>}
@@ -110,5 +113,6 @@ export function AccountTable({
         {loading && <tr><td colSpan={(compact ? 9 : 10) + (selectable ? 1 : 0)} className="empty-row">正在读取账号...</td></tr>}
       </tbody>
     </table>
-  );
+    {replaceTarget && <AccountSafeReplaceModal open account={replaceTarget} onClose={() => setReplaceTarget(null)} />}
+  </>;
 }

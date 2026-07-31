@@ -6,6 +6,7 @@ from typing import Any, Optional
 from sqlalchemy import delete, select
 
 from .alerts import evaluate_alerts, notification_payload
+from .auto_replacements import auto_replacement_service
 from .config import settings
 from .database import SessionLocal
 from .models import AlertEvent, AlertSilence, AuditEvent, Instance, MetricSample
@@ -74,9 +75,19 @@ class FleetPoller:
     ) -> None:
         started = time.perf_counter()
         snapshot: Optional[dict[str, Any]] = None
+        auto_accounts: list[dict[str, Any]] = []
         error = ""
         try:
             snapshot = await remote_client.snapshot(base_url, low_credit_threshold)
+            try:
+                account_data = await remote_client.accounts(base_url, 0)
+                auto_accounts = [
+                    item
+                    for item in (account_data.get("items") or [])
+                    if isinstance(item, dict)
+                ]
+            except RemoteError:
+                auto_accounts = []
         except RemoteError as exc:
             error = str(exc)
         latency = time.perf_counter() - started
@@ -164,6 +175,13 @@ class FleetPoller:
 
         for item in notifications:
             await notification_service.send(notification_payload(item))
+        if auto_accounts:
+            await auto_replacement_service.observe_instance(
+                instance_id=instance_id,
+                instance_name=instance.name,
+                base_url=base_url,
+                accounts=auto_accounts,
+            )
 
     def cleanup(self) -> None:
         now_ts = time.time()

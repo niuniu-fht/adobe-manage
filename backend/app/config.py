@@ -40,6 +40,10 @@ class Settings:
     smtp_from: str
     smtp_to: tuple[str, ...]
     smtp_starttls: bool
+    taem_api_url: str
+    taem_username: str
+    taem_password: str
+    taem_timeout_seconds: int
 
     @property
     def webhook_enabled(self) -> bool:
@@ -84,6 +88,10 @@ def load_settings() -> Settings:
         smtp_from=str(os.getenv("ALERT_SMTP_FROM") or "").strip(),
         smtp_to=smtp_to,
         smtp_starttls=_env_bool("ALERT_SMTP_STARTTLS", True),
+        taem_api_url=str(os.getenv("TAEM_API_URL") or "").strip().rstrip("/"),
+        taem_username=str(os.getenv("TAEM_USERNAME") or "").strip(),
+        taem_password=str(os.getenv("TAEM_PASSWORD") or ""),
+        taem_timeout_seconds=_env_int("TAEM_TIMEOUT_SECONDS", 960, 30),
     )
 
 

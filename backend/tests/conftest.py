@@ -19,6 +19,9 @@ from sqlalchemy import delete  # noqa: E402
 from app.database import SessionLocal, create_schema  # noqa: E402
 from app.main import app  # noqa: E402
 from app.security import _login_attempts  # noqa: E402
+from app.safe_replacements import safe_replacement_operations  # noqa: E402
+from app.auto_replacements import auto_replacement_service  # noqa: E402
+from app.replacement_coordinator import replacement_coordinator  # noqa: E402
 from app.models import (  # noqa: E402
     AlertEvent,
     AlertRule,
@@ -33,6 +36,9 @@ from app.models import (  # noqa: E402
 @pytest.fixture(autouse=True)
 def clean_database():
     _login_attempts.clear()
+    safe_replacement_operations.clear()
+    auto_replacement_service.clear()
+    replacement_coordinator.clear()
     create_schema()
     with SessionLocal() as db:
         for model in (
@@ -47,6 +53,9 @@ def clean_database():
             db.execute(delete(model))
         db.commit()
     yield
+    safe_replacement_operations.clear()
+    auto_replacement_service.clear()
+    replacement_coordinator.clear()
 
 
 @pytest.fixture

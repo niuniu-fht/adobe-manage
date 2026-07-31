@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowRight, ChevronDown, Gauge, RefreshCw, Save, Server, Trash2, Upload, UsersRound, WalletCards } from "lucide-react";
+import { AlertTriangle, ArrowRight, CheckCircle2, ChevronDown, Gauge, LoaderCircle, RefreshCw, Save, Server, Trash2, Upload, UsersRound, WalletCards } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { AccountTable } from "../components/AccountTable";
+import { AutoReplacementConsole } from "../components/AutoReplacementConsole";
 import { AccountBatchBar } from "../components/AccountBatchBar";
 import { AccountMoveModal } from "../components/AccountMoveModal";
 import { CookieImportModal } from "../components/CookieImportModal";
@@ -14,7 +15,7 @@ import type { AccountsResponse, FleetCreditsRefreshResponse, FleetInstance } fro
 
 interface DashboardResponse {
   instances: FleetInstance[];
-  summary: { total: number; online: number; offline: number; active_alerts: number };
+  summary: { total: number; online: number; offline: number; active_alerts: number; total_success: number; total_in_progress: number };
   preferences: { low_credit_threshold: number; account_targets: Record<string, number> };
   updated_at: number;
 }
@@ -103,10 +104,14 @@ export function OverviewPage() {
       </div>
     </section>
 
+    <AutoReplacementConsole />
+
     <section className="metric-band">
       <div><Server size={18} /><span>在线实例</span><strong>{data?.summary.online ?? "-"}</strong></div>
       <div><UsersRound size={18} /><span>可用账号</span><strong>{aggregate.accounts}</strong></div>
       <div><Gauge size={18} /><span>账号剩余积分</span><strong>{formatNumber(aggregate.credits, 1)}</strong></div>
+      <div><CheckCircle2 size={18} /><span>总成功数</span><strong className="text-success">{data?.summary.total_success ?? "-"}</strong></div>
+      <div><LoaderCircle size={18} /><span>总进行中数</span><strong>{data?.summary.total_in_progress ?? "-"}</strong></div>
       <div className={(data?.summary.active_alerts || 0) > 0 ? "metric-alert" : ""}><AlertTriangle size={18} /><span>当前告警</span><strong>{data?.summary.active_alerts ?? "-"}</strong></div>
     </section>
 
@@ -186,6 +191,7 @@ function OverviewInstanceRow({
     ?? snapshot?.requests.successful
     ?? Math.max(0, (snapshot?.requests.total || 0) - (snapshot?.requests.failed || 0));
   const todayFailed = snapshot?.requests.today?.failed ?? snapshot?.requests.failed;
+  const safetyReviewFailed = snapshot?.requests.today?.safety_review_failed;
   const availableAccounts = accountStats?.available ?? snapshot?.tokens.active;
   const totalAccounts = accountStats?.total ?? snapshot?.refresh_profiles.total ?? snapshot?.tokens.total;
 
@@ -198,8 +204,9 @@ function OverviewInstanceRow({
       <div className="fleet-stat"><span>进行中</span><strong>{snapshot?.requests.in_progress ?? "-"}</strong></div>
       <div className="fleet-stat"><span>今日成功</span><strong className="text-success">{snapshot ? todaySuccessful : "-"}</strong></div>
       <div className="fleet-stat"><span>今日失败</span><strong className={Number(todayFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? todayFailed : "-"}</strong></div>
+      <div className="fleet-stat"><span>审核失败</span><strong className={Number(safetyReviewFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? safetyReviewFailed ?? "-" : "-"}</strong></div>
       <div className="fleet-stat"><span>错误率</span><strong className={(snapshot?.requests.error_rate || 0) > 0.2 ? "text-danger" : ""}>{snapshot ? `${(snapshot.requests.error_rate * 100).toFixed(1)}%` : "-"}</strong></div>
-      <div className="fleet-mobile-counts"><span>进行中 <strong>{snapshot?.requests.in_progress ?? "-"}</strong></span><span>成功 <strong>{snapshot ? todaySuccessful : "-"}</strong></span><span>失败 <strong className={Number(todayFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? todayFailed : "-"}</strong></span><span>低积分 <strong className={(accountStats?.low_credit || 0) > 0 ? "text-danger" : ""}>{accountStats?.low_credit ?? "-"}</strong></span></div>
+      <div className="fleet-mobile-counts"><span>进行中 <strong>{snapshot?.requests.in_progress ?? "-"}</strong></span><span>成功 <strong>{snapshot ? todaySuccessful : "-"}</strong></span><span>失败 <strong className={Number(todayFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? todayFailed : "-"}</strong></span><span>审核失败 <strong className={Number(safetyReviewFailed || 0) > 0 ? "text-danger" : ""}>{snapshot ? safetyReviewFailed ?? "-" : "-"}</strong></span><span>低积分 <strong className={(accountStats?.low_credit || 0) > 0 ? "text-danger" : ""}>{accountStats?.low_credit ?? "-"}</strong></span></div>
       <div className="fleet-heartbeat"><Heartbeat points={instance.heartbeat} /></div>
       <div className="fleet-row-actions"><button className={`icon-btn expand-btn${expanded ? " expanded" : ""}`} title={supportsAccounts ? (expanded ? "收起账号" : "展开账号") : "实例端需要升级"} disabled={!supportsAccounts} onClick={onToggle}><ChevronDown size={18} /></button><Link className="icon-btn" to={`/instances/${instance.id}`} title="查看实例"><ArrowRight size={18} /></Link></div>
     </div>

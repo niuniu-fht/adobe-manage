@@ -29,6 +29,7 @@ export interface InstanceSnapshot {
       failed: number;
       generated_images: number;
       generated_videos: number;
+      safety_review_failed?: number | null;
     };
   };
   tokens: {
@@ -143,6 +144,60 @@ export interface AccountMoveResponse {
   refresh_failed_count: number;
   cleanup_failed_count: number;
   source_state_unknown_count: number;
+}
+
+export interface AccountSafeReplaceResponse {
+  status: "ok" | "partial";
+  message: string;
+  source_email: string;
+  replacement_email: string;
+  replacement_profile_id: string;
+  imported_count: number;
+  refresh_failed_count: number;
+  old_profile_removed: boolean;
+}
+
+export interface AccountSafeReplaceOperation {
+  id: string;
+  status: "starting" | "running" | "finalizing" | "done" | "partial" | "failed" | "cancelled";
+  phase: "starting" | "pulling" | "importing" | "cleanup" | "complete" | "failed" | "cancelled";
+  upstream_job_id?: number | null;
+  target: number;
+  success: number;
+  fail: number;
+  logs: string[];
+  error: string;
+  result?: AccountSafeReplaceResponse | null;
+  created_at: number;
+  updated_at: number;
+  can_cancel: boolean;
+  cancel_requested: boolean;
+}
+
+export interface AutoReplacementOperation {
+  id: string;
+  instance_id: string;
+  instance_name: string;
+  profile_id: string;
+  source_email: string;
+  trigger: string;
+  credits_available?: number | null;
+  health: string;
+  status: "queued" | "running" | "done" | "partial" | "failed" | "skipped";
+  phase: "queued" | "checking" | "local_removal" | "mother_replacement" | "importing" | "complete" | "failed";
+  upstream_job_id?: number | null;
+  logs: string[];
+  error: string;
+  replacement_email: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AutoReplacementsResponse {
+  active_id?: string | null;
+  active: boolean;
+  queued: number;
+  operations: AutoReplacementOperation[];
 }
 
 export interface ImageQueueOutput {

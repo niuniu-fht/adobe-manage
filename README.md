@@ -8,6 +8,7 @@
 - 统一查看实例、Cookie 账号、积分、刷新状态、运行配置和请求日志。
 - 总览按实例展开账号，首次展开时才加载明细，列表按剩余积分升序并独立滚动。
 - 支持粘贴 Cookie、浏览器 Cookie JSON、批量 JSON 和多文件导入。
+- 支持从 Cookie 账号直接调用 taem 的“移除并安全补号”，并将新 Cookie 回写原实例。
 - 离线、延迟、错误率、可用账号、低积分账号和刷新失败告警。
 - 通用 JSON Webhook、SMTP 邮件、告警静默和操作审计。
 - 详细日志按需读取，不复制 Prompt、Token 或 Cookie 到中心数据库。
@@ -38,6 +39,25 @@ docker compose up -d --build
 ```
 
 打开 `http://SERVER:8000`，输入 `MANAGER_ACCESS_KEY`。公网部署使用 Caddy 或 Nginx 提供 HTTPS；Caddy 示例位于 `deploy/Caddyfile.example`。
+
+管理中心与 taem 后端需要位于同一 Docker 网络，并在中心 `.env` 中配置 taem 服务地址和服务账号：
+
+```env
+TAEM_API_URL=http://backend:8000/api
+TAEM_USERNAME=admin
+TAEM_PASSWORD=replace-with-taem-admin-password
+TAEM_TIMEOUT_SECONDS=960
+```
+
+`TAEM_API_URL` 直接指向 taem 后端的 `/api` 前缀；`backend` 是 taem 当前 Compose 的服务名，可按部署配置调整。
+
+使用独立 Compose 项目部署且需要直连 taem 时，将 manager 加入 taem 的 Docker 网络：
+
+```bash
+docker compose -f docker-compose.yml -f deploy/docker-compose.taem.yml up -d --build
+```
+
+默认网络名为 `taem-compose_default`，可通过 `TAEM_DOCKER_NETWORK` 调整。
 
 ## 3. 登记实例
 
@@ -115,5 +135,6 @@ npm run build
 
 - `MANAGER_ACCESS_KEY` 只用于登录中心页面。
 - `ADOBE2API_OPS_KEY` 只用于中心访问实例，三台实例可共用。
+- “移除并安全补号”会创建 taem 拉号任务，弹窗按任务 ID 增量读取进度和日志；拉号阶段可停止，进入 Cookie 回写后会完成回写与旧账号清理。
 - 密钥和通知凭据只从环境变量读取，不写入 SQLite。
 - SQLite 数据位于 `data/manager.db`，包括实例、指标、告警、静默和审计。

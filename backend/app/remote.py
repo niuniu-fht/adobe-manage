@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from datetime import datetime
+import time
 from typing import Any, Optional
 
 import httpx
@@ -93,7 +95,80 @@ class AdobeInstanceClient:
         )
         if not isinstance(response.data, dict):
             raise RemoteError("Invalid snapshot response")
-        return response.data
+        payload = response.data
+        requests = payload.get("requests")
+        today = requests.get("today") if isinstance(requests, dict) else None
+        if isinstance(today, dict):
+            try:
+                measured_at = float(payload.get("measured_at") or time.time())
+                start_of_day = datetime.fromtimestamp(measured_at).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).timestamp()
+                today["safety_review_failed"] = (
+                    await self._today_safety_review_failures(base_url, start_of_day)
+                )
+            except (RemoteError, TypeError, ValueError):
+                today["safety_review_failed"] = None
+        return payload
+
+    async def _today_safety_review_failures(
+        self, base_url: str, start_of_day: float
+    ) -> int:
+        count = 0
+        before_ts: Optional[float] = None
+        seen_cursors: set[float] = set()
+
+        for _ in range(20):
+            params: dict[str, Any] = {
+                "limit": 500,
+                "errors_only": "true",
+            }
+            if before_ts is not None:
+                params["before_ts"] = before_ts
+            response = await self.request(
+                base_url,
+                "GET",
+                "/api/v1/ops/logs",
+                params=params,
+            )
+            data = response.data
+            if not isinstance(data, dict):
+                raise RemoteError("Invalid logs response")
+
+            reached_previous_day = False
+            for item in data.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    ts = float(item.get("ts") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts < start_of_day:
+                    reached_previous_day = True
+                    continue
+                fields = (
+                    item.get("error"),
+                    item.get("error_code"),
+                    item.get("error_type"),
+                    item.get("upstream_error_code"),
+                )
+                text = " ".join(str(value or "") for value in fields).lower()
+                if "image_unsafe" in text or "content_policy_violation" in text:
+                    count += 1
+
+            next_before = data.get("next_before_ts")
+            if reached_previous_day or next_before is None:
+                break
+            try:
+                cursor = float(next_before)
+            except (TypeError, ValueError):
+                break
+            if cursor < start_of_day or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            before_ts = cursor
+
+        return count
 
     async def accounts(
         self, base_url: str, low_credit_threshold: float
