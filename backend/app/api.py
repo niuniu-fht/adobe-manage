@@ -27,8 +27,10 @@ from .models import (
 from .notifications import notification_service
 from .polling import fleet_poller
 from .preferences import (
+    get_auto_replacement_settings,
     get_account_targets,
     get_low_credit_threshold,
+    set_auto_replacement_settings,
     set_account_targets,
     set_low_credit_threshold,
 )
@@ -41,6 +43,7 @@ from .schemas import (
     AccountBatchRequest,
     AccountSafeReplaceRequest,
     AlertRuleUpdate,
+    AutoReplacementSettingsUpdate,
     FleetCookieImportRequest,
     FleetLowCreditDeleteRequest,
     InstanceCreate,
@@ -310,6 +313,7 @@ def dashboard(db: Session = Depends(get_db)):
         "preferences": {
             "low_credit_threshold": get_low_credit_threshold(db),
             "account_targets": get_account_targets(db),
+            "auto_replacement": get_auto_replacement_settings(db),
         },
         "updated_at": time.time(),
     }
@@ -660,8 +664,46 @@ async def aggregate_accounts(
 
 
 @api_router.get("/auto-replacements")
-def auto_replacements():
-    return auto_replacement_service.snapshot()
+def auto_replacements(db: Session = Depends(get_db)):
+    return {
+        **auto_replacement_service.snapshot(),
+        "settings": get_auto_replacement_settings(db),
+        "credit_refresh": fleet_poller.credit_refresh_snapshot(),
+    }
+
+
+@api_router.put(
+    "/auto-replacements/settings", dependencies=[Depends(require_csrf)]
+)
+async def update_auto_replacement_settings(
+    payload: AutoReplacementSettingsUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    previous = get_auto_replacement_settings(db)
+    current = set_auto_replacement_settings(
+        db,
+        credit_threshold=payload.credit_threshold,
+        refresh_interval_minutes=payload.refresh_interval_minutes,
+    )
+    _record_audit(
+        db,
+        request=request,
+        instance_id=None,
+        action="settings.auto_replacement",
+        outcome="success",
+        started=started,
+        resource_type="settings",
+        resource_id="auto_replacement",
+        detail={"previous": previous, "current": current},
+    )
+    await fleet_poller.run_once(force_credit_refresh=True)
+    return {
+        "status": "ok",
+        "settings": current,
+        "credit_refresh": fleet_poller.credit_refresh_snapshot(),
+    }
 
 
 @integration_router.get("/accounts")
@@ -2639,6 +2681,7 @@ def manager_settings(db: Session = Depends(get_db)):
         "ops_key_configured": bool(settings.ops_key),
         "low_credit_threshold": get_low_credit_threshold(db),
         "account_targets": get_account_targets(db),
+        "auto_replacement": get_auto_replacement_settings(db),
         **notification_service.status(),
     }
 

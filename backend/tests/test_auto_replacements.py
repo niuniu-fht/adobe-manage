@@ -1,6 +1,7 @@
 import asyncio
 
 from app.auto_replacements import AutoReplacementOperation, AutoReplacementService
+from app.polling import FleetPoller
 from app.remote import RemoteResponse, remote_client
 from app.taem import taem_client
 
@@ -15,9 +16,10 @@ def test_auto_replacement_deletes_local_before_one_shot_domain_job(
         base_url="https://east.example",
         profile_id="profile-old",
         source_email="old@example.com",
-        trigger="积分为 0",
-        credits_available=0,
+        trigger="积分低于阈值 100 (当前 25)",
+        credits_available=25,
         health="low_credit",
+        credit_threshold=100,
     )
     calls = []
     secret = "SECRET_DOMAIN_COOKIE"
@@ -31,7 +33,7 @@ def test_auto_replacement_deletes_local_before_one_shot_domain_job(
                     "email": "old@example.com",
                     "enabled": True,
                     "health": "low_credit",
-                    "credits_available": 0,
+                    "credits_available": 25,
                 }
             ]
         }
@@ -101,6 +103,39 @@ def test_auto_replacement_deletes_local_before_one_shot_domain_job(
     assert "new@code2alita.com" in service._zero_credit_guards()
 
 
+def test_scheduled_credit_refresh_obeys_interval_and_force(monkeypatch):
+    poller = FleetPoller()
+    calls = []
+
+    async def fake_request(base_url, method, path, **kwargs):
+        calls.append((base_url, method, path, kwargs["json"]))
+
+    monkeypatch.setattr(remote_client, "request", fake_request)
+
+    async def refresh():
+        targets = [("east", "East", "https://east.example")]
+        await poller._refresh_credits_if_due(targets, 10, force=False)
+        await poller._refresh_credits_if_due(targets, 10, force=False)
+        await poller._refresh_credits_if_due(targets, 10, force=True)
+
+    asyncio.run(refresh())
+
+    assert calls == [
+        (
+            "https://east.example",
+            "POST",
+            "/api/v1/tokens/credits/refresh-batch",
+            {"ids": None},
+        ),
+        (
+            "https://east.example",
+            "POST",
+            "/api/v1/tokens/credits/refresh-batch",
+            {"ids": None},
+        ),
+    ]
+
+
 def test_auto_replacement_latches_zero_credit_and_credential_errors_once():
     service = AutoReplacementService()
 
@@ -155,6 +190,35 @@ def test_auto_replacement_latches_zero_credit_and_credential_errors_once():
     }
 
 
+def test_auto_replacement_queues_positive_credit_below_configured_threshold():
+    service = AutoReplacementService()
+
+    async def observe():
+        service._queue = asyncio.Queue()
+        queued = await service.observe_instance(
+            instance_id="east",
+            instance_name="East",
+            base_url="https://east.example",
+            credit_threshold=100,
+            accounts=[
+                {
+                    "id": "low-positive",
+                    "email": "low@example.com",
+                    "enabled": True,
+                    "health": "healthy",
+                    "credits_available": 25,
+                }
+            ],
+        )
+        return queued, service.snapshot()
+
+    queued, snapshot = asyncio.run(observe())
+
+    assert queued == 1
+    assert snapshot["operations"][0]["credit_threshold"] == 100
+    assert snapshot["operations"][0]["trigger"] == "积分低于阈值 100 (当前 25)"
+
+
 def test_new_replacement_zero_credit_guard_prevents_replacement_loop():
     service = AutoReplacementService()
     service._save_zero_credit_guards({"new@code2alita.com": 1.0})
@@ -192,4 +256,47 @@ def test_new_replacement_zero_credit_guard_prevents_replacement_loop():
 
     assert guarded == 0
     assert healthy == 0
+    assert after_release == 1
+
+
+def test_new_replacement_guard_waits_until_configured_threshold_is_reached():
+    service = AutoReplacementService()
+    service._save_zero_credit_guards({"new@code2alita.com": 1.0})
+
+    async def observe():
+        service._queue = asyncio.Queue()
+        low = {
+            "id": "new-profile",
+            "email": "new@code2alita.com",
+            "enabled": True,
+            "health": "healthy",
+            "credits_available": 20,
+        }
+        guarded = await service.observe_instance(
+            instance_id="east",
+            instance_name="East",
+            base_url="https://east.example",
+            accounts=[low],
+            credit_threshold=100,
+        )
+        reached = await service.observe_instance(
+            instance_id="east",
+            instance_name="East",
+            base_url="https://east.example",
+            accounts=[{**low, "credits_available": 100}],
+            credit_threshold=100,
+        )
+        after_release = await service.observe_instance(
+            instance_id="east",
+            instance_name="East",
+            base_url="https://east.example",
+            accounts=[low],
+            credit_threshold=100,
+        )
+        return guarded, reached, after_release
+
+    guarded, reached, after_release = asyncio.run(observe())
+
+    assert guarded == 0
+    assert reached == 0
     assert after_release == 1

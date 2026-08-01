@@ -170,6 +170,7 @@ AUTO_REPLACEMENTS = {
             "source_email": "account01@example.com",
             "trigger": "积分为 0",
             "credits_available": 0,
+            "credit_threshold": 0,
             "health": "low_credit",
             "status": "running",
             "phase": "mother_replacement",
@@ -185,6 +186,20 @@ AUTO_REPLACEMENTS = {
             "updated_at": NOW,
         }
     ],
+    "settings": {
+        "credit_threshold": 0,
+        "refresh_interval_minutes": 5,
+    },
+    "credit_refresh": {
+        "running": False,
+        "started_at": NOW - 3,
+        "finished_at": NOW - 2,
+        "next_refresh_at": NOW + 298,
+        "instances": 3,
+        "succeeded_instances": 3,
+        "failed_instances": 0,
+        "errors": [],
+    },
 }
 
 
@@ -212,6 +227,21 @@ def install_routes(page: Page, state: dict):
         state["threshold"] = float(body["low_credit_threshold"])
         state["threshold_requests"].append(body)
         fulfill(route, {"status": "ok", "low_credit_threshold": state["threshold"]})
+
+    def auto_replacements(route: Route):
+        payload = json.loads(json.dumps(AUTO_REPLACEMENTS))
+        payload["settings"] = state["auto_replacement_settings"]
+        fulfill(route, payload)
+
+    def auto_replacement_settings(route: Route):
+        body = route.request.post_data_json
+        state["auto_replacement_settings"] = body
+        state["auto_replacement_setting_requests"].append(body)
+        fulfill(route, {
+            "status": "ok",
+            "settings": body,
+            "credit_refresh": AUTO_REPLACEMENTS["credit_refresh"],
+        })
 
     def import_cookie(route: Route):
         state["imports"].append(route.request.post_data_json)
@@ -372,7 +402,8 @@ def install_routes(page: Page, state: dict):
         })
 
     page.route("**/api/dashboard", dashboard_route)
-    page.route("**/api/auto-replacements", lambda route: fulfill(route, AUTO_REPLACEMENTS))
+    page.route("**/api/auto-replacements", auto_replacements)
+    page.route("**/api/auto-replacements/settings", auto_replacement_settings)
     page.route("**/api/accounts*", all_accounts)
     page.route("**/api/instances/east/accounts", instance_accounts)
     page.route("**/api/settings/preferences", preferences)
@@ -408,7 +439,7 @@ def body_fits_viewport(page: Page) -> bool:
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(headless=True)
-    state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "safe_replaces": [], "safe_replace_error": False, "safe_replace_polls": 0, "safe_replace_cancels": 0, "safe_replace_cancelled": False, "hold_safe_replace": False, "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
+    state = {"threshold": 100, "auto_replacement_settings": {"credit_threshold": 0, "refresh_interval_minutes": 5}, "auto_replacement_setting_requests": [], "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "safe_replaces": [], "safe_replace_error": False, "safe_replace_polls": 0, "safe_replace_cancels": 0, "safe_replace_cancelled": False, "hold_safe_replace": False, "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
     console_errors = []
     context = browser.new_context(viewport={"width": 1440, "height": 900})
     page = context.new_page()
@@ -422,8 +453,17 @@ with sync_playwright() as playwright:
     assert page.locator(".metric-band").get_by_text("总成功数", exact=True).is_visible()
     assert page.locator(".metric-band").get_by_text("782", exact=True).is_visible()
     assert page.locator(".metric-band").get_by_text("总进行中数", exact=True).is_visible()
-    assert page.get_by_label("自动移除补号控制台").is_visible()
-    assert page.get_by_label("自动移除补号控制台").get_by_text("等待 5 秒后开始域名补号", exact=False).is_visible()
+    auto_console = page.get_by_label("自动移除补号控制台")
+    assert auto_console.is_visible()
+    assert auto_console.get_by_text("等待 5 秒后开始域名补号", exact=False).is_visible()
+    settings_inputs = auto_console.locator(".auto-replace-settings input")
+    assert settings_inputs.nth(0).input_value() == "5"
+    assert settings_inputs.nth(1).input_value() == "0"
+    settings_inputs.nth(0).fill("12")
+    settings_inputs.nth(1).fill("150")
+    auto_console.get_by_title("保存自动补号设置").click()
+    page.get_by_text("自动补号设置已保存，额度刷新已启动", exact=True).wait_for()
+    assert state["auto_replacement_setting_requests"] == [{"credit_threshold": 150, "refresh_interval_minutes": 12}]
     assert state["account_requests"] == 0
     assert body_fits_viewport(page)
     page.screenshot(path=ARTIFACTS / "overview-stats-desktop.png", full_page=True)
@@ -572,7 +612,7 @@ with sync_playwright() as playwright:
     assert page.locator("canvas").count() == 1
     page.screenshot(path=ARTIFACTS / "instance-detail-desktop.png", full_page=True)
 
-    mobile_state = {"threshold": 100, "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "safe_replaces": [], "safe_replace_error": False, "safe_replace_polls": 0, "safe_replace_cancels": 0, "safe_replace_cancelled": False, "hold_safe_replace": False, "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
+    mobile_state = {"threshold": 100, "auto_replacement_settings": {"credit_threshold": 150, "refresh_interval_minutes": 12}, "auto_replacement_setting_requests": [], "account_requests": 0, "threshold_requests": [], "imports": [], "batch_actions": [], "moves": [], "safe_replaces": [], "safe_replace_error": False, "safe_replace_polls": 0, "safe_replace_cancels": 0, "safe_replace_cancelled": False, "hold_safe_replace": False, "fleet_imports": [], "fleet_deletes": [], "fleet_credit_refreshes": []}
     mobile = browser.new_context(
         viewport={"width": 390, "height": 844},
         is_mobile=True,
@@ -585,7 +625,11 @@ with sync_playwright() as playwright:
     mobile_page.goto(BASE_URL, wait_until="networkidle")
     mobile_page.get_by_role("heading", name="运行总览").wait_for()
     assert mobile_page.locator(".metric-band").get_by_text("总成功数", exact=True).is_visible()
-    assert mobile_page.get_by_label("自动移除补号控制台").is_visible()
+    mobile_console = mobile_page.get_by_label("自动移除补号控制台")
+    assert mobile_console.is_visible()
+    mobile_settings_inputs = mobile_console.locator(".auto-replace-settings input")
+    assert mobile_settings_inputs.nth(0).input_value() == "12"
+    assert mobile_settings_inputs.nth(1).input_value() == "150"
     assert mobile_page.locator(".fleet-item").filter(has_text="华东节点").locator(".fleet-mobile-counts span").filter(has_text="审核失败").is_visible()
     assert body_fits_viewport(mobile_page)
     mobile_page.screenshot(path=ARTIFACTS / "overview-stats-mobile.png", full_page=True)

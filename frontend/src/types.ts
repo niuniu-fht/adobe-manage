@@ -182,6 +182,7 @@ export interface AutoReplacementOperation {
   source_email: string;
   trigger: string;
   credits_available?: number | null;
+  credit_threshold: number;
   health: string;
   status: "queued" | "running" | "done" | "partial" | "failed" | "skipped";
   phase: "queued" | "checking" | "local_removal" | "mother_replacement" | "importing" | "complete" | "failed";
@@ -198,6 +199,20 @@ export interface AutoReplacementsResponse {
   active: boolean;
   queued: number;
   operations: AutoReplacementOperation[];
+  settings: {
+    credit_threshold: number;
+    refresh_interval_minutes: number;
+  };
+  credit_refresh: {
+    running: boolean;
+    started_at?: number | null;
+    finished_at?: number | null;
+    next_refresh_at?: number | null;
+    instances: number;
+    succeeded_instances: number;
+    failed_instances: number;
+    errors: { instance_id: string; instance_name: string; error: string }[];
+  };
 }
 
 export interface ImageQueueOutput {

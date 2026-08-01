@@ -8,6 +8,10 @@ from .models import ManagerSetting
 LOW_CREDIT_THRESHOLD_KEY = "low_credit_threshold"
 DEFAULT_LOW_CREDIT_THRESHOLD = 100.0
 ACCOUNT_TARGETS_KEY = "account_targets"
+AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY = "auto_replacement_credit_threshold"
+CREDITS_REFRESH_INTERVAL_MINUTES_KEY = "credits_refresh_interval_minutes"
+DEFAULT_AUTO_REPLACEMENT_CREDIT_THRESHOLD = 0.0
+DEFAULT_CREDITS_REFRESH_INTERVAL_MINUTES = 5
 
 
 def normalize_low_credit_threshold(value: Any) -> float:
@@ -35,6 +39,64 @@ def set_low_credit_threshold(db: Session, value: Any) -> float:
         row.value = normalized
     db.commit()
     return normalized
+
+
+def normalize_auto_replacement_credit_threshold(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_AUTO_REPLACEMENT_CREDIT_THRESHOLD
+    return max(0.0, min(parsed, 1_000_000_000.0))
+
+
+def normalize_credits_refresh_interval_minutes(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_CREDITS_REFRESH_INTERVAL_MINUTES
+    return max(1, min(parsed, 1440))
+
+
+def get_auto_replacement_settings(db: Session) -> dict[str, float | int]:
+    threshold = db.get(ManagerSetting, AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY)
+    interval = db.get(ManagerSetting, CREDITS_REFRESH_INTERVAL_MINUTES_KEY)
+    return {
+        "credit_threshold": normalize_auto_replacement_credit_threshold(
+            threshold.value
+            if threshold is not None
+            else DEFAULT_AUTO_REPLACEMENT_CREDIT_THRESHOLD
+        ),
+        "refresh_interval_minutes": normalize_credits_refresh_interval_minutes(
+            interval.value
+            if interval is not None
+            else DEFAULT_CREDITS_REFRESH_INTERVAL_MINUTES
+        ),
+    }
+
+
+def set_auto_replacement_settings(
+    db: Session,
+    *,
+    credit_threshold: Any,
+    refresh_interval_minutes: Any,
+) -> dict[str, float | int]:
+    values = {
+        AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY:
+            normalize_auto_replacement_credit_threshold(credit_threshold),
+        CREDITS_REFRESH_INTERVAL_MINUTES_KEY:
+            normalize_credits_refresh_interval_minutes(refresh_interval_minutes),
+    }
+    for key, value in values.items():
+        row = db.get(ManagerSetting, key)
+        if row is None:
+            db.add(ManagerSetting(key=key, value=value))
+        else:
+            row.value = value
+    db.commit()
+    return {
+        "credit_threshold": values[AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY],
+        "refresh_interval_minutes": values[CREDITS_REFRESH_INTERVAL_MINUTES_KEY],
+    }
 
 
 def normalize_account_targets(value: Any) -> dict[str, int]:
@@ -82,6 +144,22 @@ def seed_manager_settings(db: Session) -> None:
         changed = True
     if db.get(ManagerSetting, ACCOUNT_TARGETS_KEY) is None:
         db.add(ManagerSetting(key=ACCOUNT_TARGETS_KEY, value={}))
+        changed = True
+    if db.get(ManagerSetting, AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY) is None:
+        db.add(
+            ManagerSetting(
+                key=AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY,
+                value=DEFAULT_AUTO_REPLACEMENT_CREDIT_THRESHOLD,
+            )
+        )
+        changed = True
+    if db.get(ManagerSetting, CREDITS_REFRESH_INTERVAL_MINUTES_KEY) is None:
+        db.add(
+            ManagerSetting(
+                key=CREDITS_REFRESH_INTERVAL_MINUTES_KEY,
+                value=DEFAULT_CREDITS_REFRESH_INTERVAL_MINUTES,
+            )
+        )
         changed = True
     if changed:
         db.commit()

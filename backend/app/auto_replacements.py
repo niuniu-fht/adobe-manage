@@ -29,6 +29,7 @@ class AutoReplacementOperation:
     trigger: str
     credits_available: float | None
     health: str
+    credit_threshold: float = 0.0
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     status: str = "queued"
     phase: str = "queued"
@@ -60,6 +61,7 @@ class AutoReplacementOperation:
             "source_email": self.source_email,
             "trigger": self.trigger,
             "credits_available": self.credits_available,
+            "credit_threshold": self.credit_threshold,
             "health": self.health,
             "status": self.status,
             "phase": self.phase,
@@ -108,8 +110,10 @@ class AutoReplacementService:
         instance_name: str,
         base_url: str,
         accounts: list[dict[str, Any]],
+        credit_threshold: float = 0.0,
     ) -> int:
         queued = 0
+        credit_threshold = max(0.0, float(credit_threshold or 0))
         zero_credit_guards = self._zero_credit_guards()
         guards_changed = False
         for item in accounts:
@@ -122,16 +126,34 @@ class AutoReplacementService:
             triggers = []
             if credits is not None and credits == 0:
                 triggers.append("积分为 0")
+            elif (
+                credits is not None
+                and credit_threshold > 0
+                and credits < credit_threshold
+            ):
+                triggers.append(
+                    f"积分低于阈值 {credit_threshold:g} (当前 {credits:g})"
+                )
             if health == "credential_error":
                 triggers.append("凭证异常")
             if not profile_id or not email:
                 continue
 
-            if credits is not None and credits > 0 and email in zero_credit_guards:
-                zero_credit_guards.pop(email, None)
-                guards_changed = True
-            if (
+            below_replacement_threshold = credits is not None and (
                 credits == 0
+                or (credit_threshold > 0 and credits < credit_threshold)
+            )
+            if email in zero_credit_guards:
+                threshold_reached = credits is not None and (
+                    credits >= credit_threshold
+                    if credit_threshold > 0
+                    else credits > 0
+                )
+                if threshold_reached:
+                    zero_credit_guards.pop(email, None)
+                    guards_changed = True
+            if (
+                below_replacement_threshold
                 and email in zero_credit_guards
                 and health != "credential_error"
             ):
@@ -155,6 +177,7 @@ class AutoReplacementService:
                     trigger="、".join(triggers),
                     credits_available=credits,
                     health=health,
+                    credit_threshold=credit_threshold,
                 )
                 operation.add_log(
                     f"自动触发 [{instance_name}] {email}: {operation.trigger}"
@@ -251,7 +274,15 @@ class AutoReplacementService:
             return
         current_health = str(current.get("health") or "").strip().lower()
         current_credits = self._optional_float(current.get("credits_available"))
-        still_invalid = current_health == "credential_error" or current_credits == 0
+        still_invalid = (
+            current_health == "credential_error"
+            or current_credits == 0
+            or (
+                current_credits is not None
+                and operation.credit_threshold > 0
+                and current_credits < operation.credit_threshold
+            )
+        )
         if not still_invalid:
             operation.status = "skipped"
             operation.phase = "complete"
@@ -382,7 +413,7 @@ class AutoReplacementService:
         if replacement_email:
             self._guard_zero_credit(replacement_email)
             operation.add_log(
-                "已启用新账号零积分保护；检测到正积分后自动解除"
+                "已启用新账号额度保护；额度达到自动补号阈值后解除"
             )
         if refresh_failed:
             operation.add_log("新 Cookie 已导入，但实例首次凭证刷新失败")

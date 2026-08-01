@@ -311,6 +311,43 @@ def test_low_credit_preference_is_persisted_audited_and_repolled(
         assert audit.detail == {"previous": 100.0, "current": 250.0}
 
 
+def test_auto_replacement_settings_are_persisted_and_force_credit_refresh(
+    authenticated, monkeypatch
+):
+    client, headers = authenticated
+    polls = []
+
+    async def fake_poll(*, force_credit_refresh=False):
+        polls.append(force_credit_refresh)
+
+    monkeypatch.setattr("app.api.fleet_poller.run_once", fake_poll)
+    response = client.put(
+        "/api/auto-replacements/settings",
+        headers=headers,
+        json={"credit_threshold": 750, "refresh_interval_minutes": 12},
+    )
+    settings_response = client.get("/api/settings")
+
+    assert response.status_code == 200
+    assert response.json()["settings"] == {
+        "credit_threshold": 750.0,
+        "refresh_interval_minutes": 12,
+    }
+    assert settings_response.json()["auto_replacement"] == {
+        "credit_threshold": 750.0,
+        "refresh_interval_minutes": 12,
+    }
+    assert polls == [True]
+    with SessionLocal() as db:
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "settings.auto_replacement"
+        ).one()
+        assert audit.detail["current"] == {
+            "credit_threshold": 750.0,
+            "refresh_interval_minutes": 12,
+        }
+
+
 def test_account_batch_actions_are_grouped_per_instance_and_audited(
     authenticated, monkeypatch
 ):

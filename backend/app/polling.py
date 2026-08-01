@@ -11,7 +11,7 @@ from .config import settings
 from .database import SessionLocal
 from .models import AlertEvent, AlertSilence, AuditEvent, Instance, MetricSample
 from .notifications import notification_service
-from .preferences import get_low_credit_threshold
+from .preferences import get_auto_replacement_settings, get_low_credit_threshold
 from .remote import RemoteError, remote_client
 
 
@@ -20,6 +20,15 @@ class FleetPoller:
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
         self._last_cleanup = 0.0
+        self._credit_refresh_running = False
+        self._credit_refresh_started_at = 0.0
+        self._credit_refresh_finished_at = 0.0
+        self._credit_refresh_result: dict[str, Any] = {
+            "instances": 0,
+            "succeeded_instances": 0,
+            "failed_instances": 0,
+            "errors": [],
+        }
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -49,29 +58,42 @@ class FleetPoller:
             except asyncio.TimeoutError:
                 pass
 
-    async def run_once(self) -> None:
+    async def run_once(self, *, force_credit_refresh: bool = False) -> None:
         with SessionLocal() as db:
             low_credit_threshold = get_low_credit_threshold(db)
+            auto_settings = get_auto_replacement_settings(db)
             targets = [
-                (item.id, item.base_url)
+                (item.id, item.name, item.base_url)
                 for item in db.scalars(
                     select(Instance).where(Instance.enabled.is_(True))
                 ).all()
             ]
         if targets:
+            await self._refresh_credits_if_due(
+                targets,
+                int(auto_settings["refresh_interval_minutes"]),
+                force=force_credit_refresh,
+            )
             await asyncio.gather(
                 *(
                     self._poll_instance(
-                        instance_id, base_url, low_credit_threshold
+                        instance_id,
+                        base_url,
+                        low_credit_threshold,
+                        float(auto_settings["credit_threshold"]),
                     )
-                    for instance_id, base_url in targets
+                    for instance_id, _instance_name, base_url in targets
                 )
             )
         if time.time() - self._last_cleanup >= 3600:
             self.cleanup()
 
     async def _poll_instance(
-        self, instance_id: str, base_url: str, low_credit_threshold: float = 100.0
+        self,
+        instance_id: str,
+        base_url: str,
+        low_credit_threshold: float = 100.0,
+        auto_replacement_credit_threshold: float = 0.0,
     ) -> None:
         started = time.perf_counter()
         snapshot: Optional[dict[str, Any]] = None
@@ -181,7 +203,81 @@ class FleetPoller:
                 instance_name=instance.name,
                 base_url=base_url,
                 accounts=auto_accounts,
+                credit_threshold=auto_replacement_credit_threshold,
             )
+
+    async def _refresh_credits_if_due(
+        self,
+        targets: list[tuple[str, str, str]],
+        interval_minutes: int,
+        *,
+        force: bool,
+    ) -> None:
+        now = time.time()
+        interval_seconds = max(1, int(interval_minutes)) * 60
+        if self._credit_refresh_running:
+            return
+        if (
+            not force
+            and self._credit_refresh_finished_at
+            and now < self._credit_refresh_finished_at + interval_seconds
+        ):
+            return
+
+        self._credit_refresh_running = True
+        self._credit_refresh_started_at = now
+
+        async def refresh(instance_id: str, instance_name: str, base_url: str):
+            try:
+                await remote_client.request(
+                    base_url,
+                    "POST",
+                    "/api/v1/tokens/credits/refresh-batch",
+                    json={"ids": None},
+                    timeout=180,
+                )
+                return {
+                    "instance_id": instance_id,
+                    "instance_name": instance_name,
+                    "error": "",
+                }
+            except RemoteError as exc:
+                return {
+                    "instance_id": instance_id,
+                    "instance_name": instance_name,
+                    "error": str(exc)[:300],
+                }
+
+        try:
+            results = await asyncio.gather(*(refresh(*target) for target in targets))
+            errors = [item for item in results if item["error"]]
+            self._credit_refresh_result = {
+                "instances": len(results),
+                "succeeded_instances": len(results) - len(errors),
+                "failed_instances": len(errors),
+                "errors": errors[:20],
+            }
+        finally:
+            self._credit_refresh_finished_at = time.time()
+            self._credit_refresh_running = False
+
+    def credit_refresh_snapshot(self) -> dict[str, Any]:
+        with SessionLocal() as db:
+            interval_minutes = int(
+                get_auto_replacement_settings(db)["refresh_interval_minutes"]
+            )
+        next_refresh_at = (
+            self._credit_refresh_finished_at + interval_minutes * 60
+            if self._credit_refresh_finished_at
+            else time.time()
+        )
+        return {
+            "running": self._credit_refresh_running,
+            "started_at": self._credit_refresh_started_at or None,
+            "finished_at": self._credit_refresh_finished_at or None,
+            "next_refresh_at": next_refresh_at,
+            **self._credit_refresh_result,
+        }
 
     def cleanup(self) -> None:
         now_ts = time.time()
