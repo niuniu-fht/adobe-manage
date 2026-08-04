@@ -11,6 +11,7 @@ from typing import Any, Optional
 from .config import settings
 from .database import SessionLocal
 from .models import ManagerSetting
+from .preferences import get_auto_replacement_settings
 from .remote import RemoteError, remote_client
 from .replacement_coordinator import replacement_coordinator
 from .taem import TaemError, taem_client
@@ -37,6 +38,7 @@ class AutoReplacementOperation:
     logs: list[str] = field(default_factory=list)
     error: str = ""
     replacement_email: str = ""
+    remove_only: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -69,6 +71,7 @@ class AutoReplacementOperation:
             "logs": list(self.logs),
             "error": self.error,
             "replacement_email": self.replacement_email,
+            "remove_only": self.remove_only,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -134,8 +137,11 @@ class AutoReplacementService:
                 triggers.append(
                     f"积分低于阈值 {credit_threshold:g} (当前 {credits:g})"
                 )
+            error_trigger = self._error_trigger(item)
             if health == "credential_error":
                 triggers.append("凭证异常")
+            elif error_trigger:
+                triggers.append(error_trigger)
             if not profile_id or not email:
                 continue
 
@@ -274,8 +280,10 @@ class AutoReplacementService:
             return
         current_health = str(current.get("health") or "").strip().lower()
         current_credits = self._optional_float(current.get("credits_available"))
+        current_error_trigger = self._error_trigger(current)
         still_invalid = (
             current_health == "credential_error"
+            or bool(current_error_trigger)
             or current_credits == 0
             or (
                 current_credits is not None
@@ -310,12 +318,22 @@ class AutoReplacementService:
         ):
             self._fail(operation, "实例未确认当前账号已移除，远端母号流程未启动")
             return
-        operation.add_log("实例本地账号已移除，开始调用母号一次性域名补号")
+        with SessionLocal() as db:
+            auto_settings = get_auto_replacement_settings(db)
+        auto_refill_enabled = bool(auto_settings.get("enabled", True))
+        remove_only = not auto_refill_enabled
+        operation.remove_only = remove_only
+        if remove_only:
+            operation.add_log("实例本地账号已移除，自动补号开关已关闭，开始调用母号仅移除流程")
+        else:
+            operation.add_log("实例本地账号已移除，开始调用母号一次性域名补号")
 
         operation.phase = "mother_replacement"
         try:
-            upstream = await taem_client.start_replace_member_domain(
-                operation.source_email
+            upstream = (
+                await taem_client.start_remove_member_only(operation.source_email)
+                if remove_only
+                else await taem_client.start_replace_member_domain(operation.source_email)
             )
             operation.upstream_job_id = int(upstream.get("id"))
         except (TaemError, TypeError, ValueError) as exc:
@@ -344,7 +362,8 @@ class AutoReplacementService:
                 continue
             if upstream_status != "done":
                 detail = str(upstream.get("error") or f"任务状态:{upstream_status}")
-                self._fail(operation, f"母号域名补号结束:{detail}")
+                label = "母号仅移除流程" if remove_only else "母号域名补号"
+                self._fail(operation, f"{label}结束:{detail}")
                 return
             upstream_result = (
                 upstream.get("result")
@@ -354,6 +373,14 @@ class AutoReplacementService:
             break
         else:
             self._fail(operation, "母号域名补号等待超时")
+            return
+
+        if remove_only:
+            operation.phase = "complete"
+            operation.status = "done"
+            operation.add_log("异常账号已从实例与母号侧移除，已跳过后续自动补号")
+            with self._lock:
+                self._latched.discard(operation.latch_key)
             return
 
         replacement = (
@@ -419,6 +446,36 @@ class AutoReplacementService:
             operation.add_log("新 Cookie 已导入，但实例首次凭证刷新失败")
         else:
             operation.add_log("自动移除、一次性域名补号和 Cookie 回写全部完成")
+
+    @staticmethod
+    def _error_trigger(item: dict[str, Any]) -> str:
+        values = [
+            item.get("last_error"),
+            item.get("error"),
+            item.get("message"),
+            item.get("credential_status"),
+        ]
+        text = " ".join(str(value or "") for value in values).strip().lower()
+        if not text:
+            return ""
+        if "arkose" in text or "captcha" in text:
+            return "Arkose captcha / forbidden" if "forbidden" in text else "Arkose captcha"
+        if "forbidden" in text:
+            return "forbidden"
+        quota_keywords = (
+            "quota",
+            "credit",
+            "credits",
+            "额度",
+            "积分",
+            "errmismatchoauthtoken",
+            "token not allowed",
+            "403014",
+            "403",
+        )
+        if any(keyword in text for keyword in quota_keywords):
+            return "额度异常"
+        return ""
 
     @staticmethod
     def _account_email(item: dict[str, Any]) -> str:

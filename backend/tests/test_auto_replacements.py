@@ -300,3 +300,121 @@ def test_new_replacement_guard_waits_until_configured_threshold_is_reached():
     assert guarded == 0
     assert reached == 0
     assert after_release == 1
+
+
+
+def test_auto_replacement_remove_only_when_refill_switch_is_closed(monkeypatch):
+    service = AutoReplacementService()
+    operation = AutoReplacementOperation(
+        instance_id="east",
+        instance_name="East",
+        base_url="https://east.example",
+        profile_id="profile-old",
+        source_email="old@example.com",
+        trigger="forbidden",
+        credits_available=None,
+        health="healthy",
+        credit_threshold=0,
+    )
+    calls = []
+
+    async def fake_accounts(_base_url, _threshold):
+        calls.append("accounts")
+        return {
+            "items": [
+                {
+                    "id": "profile-old",
+                    "email": "old@example.com",
+                    "enabled": True,
+                    "health": "healthy",
+                    "last_error": "Use /v4/accounts when Arkose captcha is enabled forbidden",
+                }
+            ]
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        calls.append(path)
+        assert path.endswith("delete-batch")
+        assert kwargs["json"] == {"ids": ["profile-old"]}
+        return RemoteResponse(
+            200,
+            {"status": "ok", "deleted_count": 1, "deleted_ids": ["profile-old"]},
+            {},
+        )
+
+    async def fake_remove_only(email):
+        calls.append("taem-remove-only")
+        assert email == "old@example.com"
+        return {"id": 88, "status": "running"}
+
+    async def fake_domain(_email):
+        raise AssertionError("domain replacement should be skipped")
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        calls.append("taem-job")
+        assert job_id == 88
+        return {
+            "id": 88,
+            "status": "done",
+            "log_total": 1,
+            "logs": ["仅移除完成"],
+            "result": {"removed_only": True},
+        }
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_remove_member_only", fake_remove_only)
+    monkeypatch.setattr(taem_client, "start_replace_member_domain", fake_domain)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {"credit_threshold": 0.0, "refresh_interval_minutes": 5, "enabled": False},
+    )
+
+    asyncio.run(service._process(operation))
+
+    assert calls == ["accounts", "/api/v1/refresh-profiles/delete-batch", "taem-remove-only", "taem-job"]
+    assert operation.status == "done"
+    assert operation.phase == "complete"
+    assert operation.remove_only is True
+    assert operation.replacement_email == ""
+    assert "跳过后续自动补号" in "\n".join(operation.logs)
+
+
+def test_auto_replacement_queues_arkose_forbidden_and_quota_errors():
+    service = AutoReplacementService()
+
+    async def observe():
+        service._queue = asyncio.Queue()
+        queued = await service.observe_instance(
+            instance_id="east",
+            instance_name="East",
+            base_url="https://east.example",
+            accounts=[
+                {
+                    "id": "arkose",
+                    "email": "arkose@example.com",
+                    "enabled": True,
+                    "health": "healthy",
+                    "credits_available": 500,
+                    "last_error": "Use /v4/accounts when Arkose captcha is enabled forbidden",
+                },
+                {
+                    "id": "quota",
+                    "email": "quota@example.com",
+                    "enabled": True,
+                    "health": "healthy",
+                    "credits_available": 500,
+                    "last_error": "额度接口返回 403: Token not allowed in the current context",
+                },
+            ],
+        )
+        return queued, service.snapshot()
+
+    queued, snapshot = asyncio.run(observe())
+
+    assert queued == 2
+    assert {item["trigger"] for item in snapshot["operations"]} == {
+        "Arkose captcha / forbidden",
+        "额度异常",
+    }

@@ -324,7 +324,7 @@ def test_auto_replacement_settings_are_persisted_and_force_credit_refresh(
     response = client.put(
         "/api/auto-replacements/settings",
         headers=headers,
-        json={"credit_threshold": 750, "refresh_interval_minutes": 12},
+        json={"credit_threshold": 750, "refresh_interval_minutes": 12, "enabled": False},
     )
     settings_response = client.get("/api/settings")
 
@@ -332,10 +332,12 @@ def test_auto_replacement_settings_are_persisted_and_force_credit_refresh(
     assert response.json()["settings"] == {
         "credit_threshold": 750.0,
         "refresh_interval_minutes": 12,
+        "enabled": False,
     }
     assert settings_response.json()["auto_replacement"] == {
         "credit_threshold": 750.0,
         "refresh_interval_minutes": 12,
+        "enabled": False,
     }
     assert polls == [True]
     with SessionLocal() as db:
@@ -345,6 +347,7 @@ def test_auto_replacement_settings_are_persisted_and_force_credit_refresh(
         assert audit.detail["current"] == {
             "credit_threshold": 750.0,
             "refresh_interval_minutes": 12,
+            "enabled": False,
         }
 
 

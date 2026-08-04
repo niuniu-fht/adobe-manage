@@ -183,7 +183,15 @@ class TaemClient:
                 "email": email,
                 "domain": "code2alita.com",
                 "prefix": "manager-auto",
+                "auto": True,
             },
+            timeout=30,
+        )
+
+    async def start_remove_member_only(self, email: str) -> dict[str, Any]:
+        return await self._authenticated_post(
+            "/adobe-accounts/remove-member-only",
+            payload={"email": email, "auto": True, "remove_only": True},
             timeout=30,
         )
 

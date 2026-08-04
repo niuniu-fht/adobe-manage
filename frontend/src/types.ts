@@ -190,6 +190,7 @@ export interface AutoReplacementOperation {
   logs: string[];
   error: string;
   replacement_email: string;
+  remove_only: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -202,6 +203,7 @@ export interface AutoReplacementsResponse {
   settings: {
     credit_threshold: number;
     refresh_interval_minutes: number;
+    enabled: boolean;
   };
   credit_refresh: {
     running: boolean;

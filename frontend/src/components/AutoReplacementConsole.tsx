@@ -18,6 +18,7 @@ export function AutoReplacementConsole() {
   const scrollRef = useRef<HTMLPreElement>(null);
   const [creditThreshold, setCreditThreshold] = useState("0");
   const [refreshMinutes, setRefreshMinutes] = useState("5");
+  const [autoRefillEnabled, setAutoRefillEnabled] = useState(true);
   const [settingsDirty, setSettingsDirty] = useState(false);
   const query = useQuery({
     queryKey: ["auto-replacements"],
@@ -31,6 +32,7 @@ export function AutoReplacementConsole() {
     if (!settingsDirty && query.data?.settings) {
       setCreditThreshold(String(query.data.settings.credit_threshold));
       setRefreshMinutes(String(query.data.settings.refresh_interval_minutes));
+      setAutoRefillEnabled(Boolean(query.data.settings.enabled ?? true));
     }
   }, [query.data?.settings, settingsDirty]);
 
@@ -50,15 +52,17 @@ export function AutoReplacementConsole() {
         method: "PUT",
         body: JSON.stringify({
           credit_threshold: threshold,
-          refresh_interval_minutes: minutes
+          refresh_interval_minutes: minutes,
+          enabled: autoRefillEnabled
         })
       });
     },
     onSuccess: async (payload) => {
       setCreditThreshold(String(payload.settings.credit_threshold));
       setRefreshMinutes(String(payload.settings.refresh_interval_minutes));
+      setAutoRefillEnabled(Boolean(payload.settings.enabled ?? true));
       setSettingsDirty(false);
-      emitToast("自动补号设置已保存，额度刷新已启动", "success");
+      emitToast(payload.settings.enabled ? "自动补号设置已保存，额度刷新已启动" : "已保存：异常账号移除后跳过后续补号", "success");
       await queryClient.invalidateQueries({ queryKey: ["auto-replacements"] });
     },
     onError: (error) => emitToast(error.message, "error")
@@ -78,13 +82,14 @@ export function AutoReplacementConsole() {
     <header>
       <div className="console-title"><SquareTerminal size={17} /><strong>自动移除补号</strong><span className={`console-status${statusClass}`}>{latest ? STATUS_LABELS[latest.status] : "待命"}</span></div>
       <div className="console-context">
-        {active ? <><LoaderCircle size={14} className="spin" /><strong>{active.instance_name}</strong><span>{active.source_email}</span><span>{active.trigger}</span></> : latest ? <><StatusIcon operation={latest} /><strong>{latest.instance_name}</strong><span>{latest.source_email}</span></> : <span>串行队列空闲</span>}
+        {active ? <><LoaderCircle size={14} className="spin" /><strong>{active.instance_name}</strong><span>{active.source_email}</span><span>{active.trigger}</span>{active.remove_only && <span>仅移除</span>}</> : latest ? <><StatusIcon operation={latest} /><strong>{latest.instance_name}</strong><span>{latest.source_email}</span>{latest.remove_only && <span>仅移除</span>}</> : <span>串行队列空闲</span>}
         <b>队列 {query.data?.queued ?? 0}</b>
       </div>
     </header>
     <div className="auto-replace-settings">
       <label><span>额度刷新</span><input type="number" min="1" max="1440" step="1" value={refreshMinutes} onChange={(event) => { setRefreshMinutes(event.target.value); setSettingsDirty(true); }} /><b>分钟</b></label>
       <label><span>补号阈值</span><input type="number" min="0" step="1" value={creditThreshold} onChange={(event) => { setCreditThreshold(event.target.value); setSettingsDirty(true); }} /></label>
+      <label className="auto-refill-toggle"><input type="checkbox" checked={autoRefillEnabled} onChange={(event) => { setAutoRefillEnabled(event.target.checked); setSettingsDirty(true); }} /><span>{autoRefillEnabled ? "补号开启" : "仅移除"}</span></label>
       <button className="icon-btn" title="保存自动补号设置" disabled={saveSettings.isPending || !settingsDirty} onClick={() => saveSettings.mutate()}><Save size={15} /></button>
       <small>{query.data?.credit_refresh.running ? "正在刷新额度" : `下次刷新 ${formatTime(query.data?.credit_refresh.next_refresh_at)}`}</small>
     </div>

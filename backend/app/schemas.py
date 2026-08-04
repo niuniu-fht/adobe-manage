@@ -72,6 +72,7 @@ class ManagerPreferencesUpdate(BaseModel):
 class AutoReplacementSettingsUpdate(BaseModel):
     credit_threshold: float = Field(ge=0, le=1_000_000_000)
     refresh_interval_minutes: int = Field(ge=1, le=1440)
+    enabled: bool = True
 
 
 class AccountBatchRequest(BaseModel):
