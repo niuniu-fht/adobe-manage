@@ -95,7 +95,14 @@ def spa(path: str):
         return JSONResponse(status_code=404, content={"detail": "Not found"})
     index = frontend_dist / "index.html"
     if index.exists():
-        return FileResponse(index)
+        return FileResponse(
+            index,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
     return JSONResponse(
         status_code=503,
         content={"detail": "Frontend is not built. Run npm run build in frontend."},
