@@ -321,10 +321,16 @@ class AutoReplacementService:
         with SessionLocal() as db:
             auto_settings = get_auto_replacement_settings(db)
         auto_refill_enabled = bool(auto_settings.get("enabled", True))
-        remove_only = not auto_refill_enabled
+        trigger_text = str(operation.trigger or "").lower()
+        remove_only_trigger = any(
+            keyword in trigger_text
+            for keyword in ("arkose", "captcha", "forbidden", "额度异常")
+        )
+        remove_only = (not auto_refill_enabled) or remove_only_trigger
         operation.remove_only = remove_only
         if remove_only:
-            operation.add_log("实例本地账号已移除，自动补号开关已关闭，开始调用母号仅移除流程")
+            reason = "触发 Arkose/forbidden/额度异常" if remove_only_trigger else "自动补号开关已关闭"
+            operation.add_log(f"实例本地账号已移除，{reason}，开始调用母号仅移除流程")
         else:
             operation.add_log("实例本地账号已移除，开始调用母号一次性域名补号")
 

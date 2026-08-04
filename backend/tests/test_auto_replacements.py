@@ -303,7 +303,7 @@ def test_new_replacement_guard_waits_until_configured_threshold_is_reached():
 
 
 
-def test_auto_replacement_remove_only_when_refill_switch_is_closed(monkeypatch):
+def test_auto_replacement_remove_only_for_arkose_forbidden_even_when_refill_is_open(monkeypatch):
     service = AutoReplacementService()
     operation = AutoReplacementOperation(
         instance_id="east",
@@ -368,7 +368,7 @@ def test_auto_replacement_remove_only_when_refill_switch_is_closed(monkeypatch):
     monkeypatch.setattr(taem_client, "get_job", fake_get_job)
     monkeypatch.setattr(
         "app.auto_replacements.get_auto_replacement_settings",
-        lambda _db: {"credit_threshold": 0.0, "refresh_interval_minutes": 5, "enabled": False},
+        lambda _db: {"credit_threshold": 0.0, "refresh_interval_minutes": 5, "enabled": True},
     )
 
     asyncio.run(service._process(operation))
@@ -379,6 +379,73 @@ def test_auto_replacement_remove_only_when_refill_switch_is_closed(monkeypatch):
     assert operation.remove_only is True
     assert operation.replacement_email == ""
     assert "跳过后续自动补号" in "\n".join(operation.logs)
+
+
+
+def test_auto_replacement_remove_only_when_refill_switch_is_closed_for_low_credit(monkeypatch):
+    service = AutoReplacementService()
+    operation = AutoReplacementOperation(
+        instance_id="east",
+        instance_name="East",
+        base_url="https://east.example",
+        profile_id="profile-low",
+        source_email="low@example.com",
+        trigger="积分低于阈值 100 (当前 25)",
+        credits_available=25,
+        health="low_credit",
+        credit_threshold=100,
+    )
+    calls = []
+
+    async def fake_accounts(_base_url, _threshold):
+        return {
+            "items": [
+                {
+                    "id": "profile-low",
+                    "email": "low@example.com",
+                    "enabled": True,
+                    "health": "low_credit",
+                    "credits_available": 25,
+                }
+            ]
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        calls.append(path)
+        return RemoteResponse(
+            200,
+            {"status": "ok", "deleted_count": 1, "deleted_ids": ["profile-low"]},
+            {},
+        )
+
+    async def fake_remove_only(email):
+        calls.append("taem-remove-only")
+        assert email == "low@example.com"
+        return {"id": 89, "status": "running"}
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        return {
+            "id": job_id,
+            "status": "done",
+            "log_total": 0,
+            "logs": [],
+            "result": {"removed_only": True},
+        }
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_remove_member_only", fake_remove_only)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {"credit_threshold": 100.0, "refresh_interval_minutes": 5, "enabled": False},
+    )
+
+    asyncio.run(service._process(operation))
+
+    assert calls == ["/api/v1/refresh-profiles/delete-batch", "taem-remove-only"]
+    assert operation.status == "done"
+    assert operation.remove_only is True
 
 
 def test_auto_replacement_queues_arkose_forbidden_and_quota_errors():
