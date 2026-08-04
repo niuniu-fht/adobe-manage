@@ -66,11 +66,20 @@ code, pre { font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
 .console-status-done { color: #84d8b5; border-color: #3e7862; background: #1c3028; }
 .console-status-failed { color: #ee9da2; border-color: #81474c; background: #352124; }
 .console-status-partial, .console-status-skipped { color: #b9c8ce; border-color: #52636c; background: #243038; }
+.refill-mode-badge { min-height: 21px; display: inline-flex; align-items: center; padding: 0 8px; border: 1px solid #49636d; border-radius: 999px; color: #cbd9df; background: #20303a; font-size: 9px; font-weight: 800; }
+.refill-mode-registered_reuse { color: #95e9c7; border-color: #377a60; background: #183227; }
 .auto-replace-settings { min-height: 41px; display: flex; align-items: center; gap: 10px; padding: 5px 14px; color: #9eafb8; background: #151f24; border-bottom: 1px solid #2c3941; }
 .auto-replace-settings label { display: flex; align-items: center; gap: 6px; font-size: 10px; white-space: nowrap; }
 .auto-replace-settings input { width: 82px; height: 28px; padding: 0 7px; color: #e7eef1; background: #0f171b; border-color: #40515a; }
 .auto-replace-settings .auto-refill-toggle { padding: 0 8px; height: 28px; border: 1px solid #40515a; border-radius: 999px; background: #0f171b; color: #dbe7ec; }
 .auto-replace-settings .auto-refill-toggle input { width: 14px; height: 14px; min-width: 14px; padding: 0; accent-color: #2f80ed; }
+.refill-mode-switch { min-height: 30px; display: inline-flex; align-items: center; gap: 4px; padding: 2px; border: 1px solid #40515a; border-radius: 999px; background: #0f171b; white-space: nowrap; }
+.refill-mode-switch > span { padding: 0 7px 0 8px; color: #b9c8ce; font-size: 10px; font-weight: 700; }
+.refill-mode-switch button { height: 24px; padding: 0 10px; border: 0; border-radius: 999px; color: #9eafb8; background: transparent; font-size: 10px; font-weight: 800; }
+.refill-mode-switch button.active { color: #102219; background: #71d8aa; box-shadow: 0 0 0 1px #91e4bf inset; }
+.refill-mode-switch button:not(:disabled):hover { color: #e7eef1; background: #223139; }
+.refill-mode-switch button.active:not(:disabled):hover { color: #102219; background: #80e3b7; }
+.refill-mode-switch button:disabled { cursor: not-allowed; opacity: .45; }
 .auto-replace-settings label b { color: #9eafb8; font-size: 9px; font-weight: 500; }
 .auto-replace-settings .icon-btn { width: 28px; height: 28px; flex-basis: 28px; color: #dce7eb; background: #223139; border-color: #40515a; }
 .auto-replace-settings small { margin-left: auto; color: #82959f; font-size: 9px; white-space: nowrap; }

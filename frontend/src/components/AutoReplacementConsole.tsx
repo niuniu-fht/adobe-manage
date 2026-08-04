@@ -83,9 +83,14 @@ export function AutoReplacementConsole() {
   }, [logText]);
 
   const statusClass = latest ? ` console-status-${latest.status}` : "";
+  const refillModeText = refillMode === "registered_reuse" ? "已注册补号" : "新注册补号";
+  const switchRefillMode = (mode: "new_domain" | "registered_reuse") => {
+    setRefillMode(mode);
+    setSettingsDirty(true);
+  };
   return <section className="auto-replace-console" aria-label="自动移除补号控制台">
     <header>
-      <div className="console-title"><SquareTerminal size={17} /><strong>自动移除补号</strong><span className={`console-status${statusClass}`}>{latest ? STATUS_LABELS[latest.status] : "待命"}</span></div>
+      <div className="console-title"><SquareTerminal size={17} /><strong>自动移除补号</strong><span className={`console-status${statusClass}`}>{latest ? STATUS_LABELS[latest.status] : "待命"}</span><span className={`refill-mode-badge refill-mode-${refillMode}`}>{refillModeText}</span></div>
       <div className="console-context">
         {active ? <><LoaderCircle size={14} className="spin" /><strong>{active.instance_name}</strong><span>{active.source_email}</span><span>{active.trigger}</span>{active.remove_only && <span>仅移除</span>}</> : latest ? <><StatusIcon operation={latest} /><strong>{latest.instance_name}</strong><span>{latest.source_email}</span>{latest.remove_only && <span>仅移除</span>}</> : <span>串行队列空闲</span>}
         <b>队列 {query.data?.queued ?? 0}</b>
@@ -95,7 +100,11 @@ export function AutoReplacementConsole() {
       <label><span>额度刷新</span><input type="number" min="1" max="1440" step="1" value={refreshMinutes} onChange={(event) => { setRefreshMinutes(event.target.value); setSettingsDirty(true); }} /><b>分钟</b></label>
       <label><span>补号阈值</span><input type="number" min="0" step="1" value={creditThreshold} onChange={(event) => { setCreditThreshold(event.target.value); setSettingsDirty(true); }} /></label>
       <label className="auto-refill-toggle"><input type="checkbox" checked={autoRefillEnabled} onChange={(event) => { setAutoRefillEnabled(event.target.checked); setSettingsDirty(true); }} /><span>{autoRefillEnabled ? "补号开启" : "仅移除"}</span></label>
-      <label><span>补号方式</span><select value={refillMode} disabled={!autoRefillEnabled} onChange={(event) => { setRefillMode(event.target.value === "registered_reuse" ? "registered_reuse" : "new_domain"); setSettingsDirty(true); }}><option value="new_domain">新注册补号</option><option value="registered_reuse">已注册补号</option></select></label>
+      <div className="refill-mode-switch" role="radiogroup" aria-label="补号方式">
+        <span>补号方式</span>
+        <button type="button" className={refillMode === "new_domain" ? "active" : ""} disabled={!autoRefillEnabled} aria-pressed={refillMode === "new_domain"} onClick={() => switchRefillMode("new_domain")}>新注册补号</button>
+        <button type="button" className={refillMode === "registered_reuse" ? "active" : ""} disabled={!autoRefillEnabled} aria-pressed={refillMode === "registered_reuse"} onClick={() => switchRefillMode("registered_reuse")}>已注册补号</button>
+      </div>
       <button className="icon-btn" title="保存自动补号设置" disabled={saveSettings.isPending || !settingsDirty} onClick={() => saveSettings.mutate()}><Save size={15} /></button>
       <small>{query.data?.credit_refresh.running ? "正在刷新额度" : `下次刷新 ${formatTime(query.data?.credit_refresh.next_refresh_at)}`}</small>
     </div>
