@@ -176,7 +176,10 @@ class TaemClient:
             timeout=30,
         )
 
-    async def start_replace_member_domain(self, email: str) -> dict[str, Any]:
+    async def start_replace_member_domain(
+        self, email: str, *, source: str = "new_domain"
+    ) -> dict[str, Any]:
+        source = source if source in {"new_domain", "registered_reuse"} else "new_domain"
         return await self._authenticated_post(
             "/adobe-accounts/replace-member-domain",
             payload={
@@ -184,6 +187,7 @@ class TaemClient:
                 "domain": "code2alita.com",
                 "prefix": "manager-auto",
                 "auto": True,
+                "source": source,
             },
             timeout=30,
         )

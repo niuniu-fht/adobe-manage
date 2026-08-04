@@ -73,6 +73,15 @@ class AutoReplacementSettingsUpdate(BaseModel):
     credit_threshold: float = Field(ge=0, le=1_000_000_000)
     refresh_interval_minutes: int = Field(ge=1, le=1440)
     enabled: bool = True
+    refill_mode: str = "new_domain"
+
+    @field_validator("refill_mode")
+    @classmethod
+    def validate_refill_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"new_domain", "registered_reuse"}:
+            return "new_domain"
+        return normalized
 
 
 class AccountBatchRequest(BaseModel):

@@ -687,6 +687,7 @@ async def update_auto_replacement_settings(
         credit_threshold=payload.credit_threshold,
         refresh_interval_minutes=payload.refresh_interval_minutes,
         enabled=payload.enabled,
+        refill_mode=payload.refill_mode,
     )
     _record_audit(
         db,

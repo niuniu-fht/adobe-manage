@@ -204,6 +204,7 @@ export interface AutoReplacementsResponse {
     credit_threshold: number;
     refresh_interval_minutes: number;
     enabled: boolean;
+    refill_mode: "new_domain" | "registered_reuse";
   };
   credit_refresh: {
     running: boolean;

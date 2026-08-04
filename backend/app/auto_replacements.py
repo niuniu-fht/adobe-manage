@@ -321,6 +321,9 @@ class AutoReplacementService:
         with SessionLocal() as db:
             auto_settings = get_auto_replacement_settings(db)
         auto_refill_enabled = bool(auto_settings.get("enabled", True))
+        refill_mode = str(auto_settings.get("refill_mode") or "new_domain")
+        if refill_mode not in {"new_domain", "registered_reuse"}:
+            refill_mode = "new_domain"
         trigger_text = str(operation.trigger or "").lower()
         remove_only_trigger = any(
             keyword in trigger_text
@@ -332,14 +335,18 @@ class AutoReplacementService:
             reason = "触发 Arkose/forbidden/额度异常" if remove_only_trigger else "自动补号开关已关闭"
             operation.add_log(f"实例本地账号已移除，{reason}，开始调用母号仅移除流程")
         else:
-            operation.add_log("实例本地账号已移除，开始调用母号一次性域名补号")
+            label = "已注册补号" if refill_mode == "registered_reuse" else "域名邮箱新注册补号"
+            operation.add_log(f"实例本地账号已移除，开始调用母号{label}")
 
         operation.phase = "mother_replacement"
         try:
             upstream = (
                 await taem_client.start_remove_member_only(operation.source_email)
                 if remove_only
-                else await taem_client.start_replace_member_domain(operation.source_email)
+                else await taem_client.start_replace_member_domain(
+                    operation.source_email,
+                    source=refill_mode,
+                )
             )
             operation.upstream_job_id = int(upstream.get("id"))
         except (TaemError, TypeError, ValueError) as exc:
@@ -368,7 +375,11 @@ class AutoReplacementService:
                 continue
             if upstream_status != "done":
                 detail = str(upstream.get("error") or f"任务状态:{upstream_status}")
-                label = "母号仅移除流程" if remove_only else "母号域名补号"
+                label = (
+                    "母号仅移除流程"
+                    if remove_only
+                    else ("母号已注册补号" if refill_mode == "registered_reuse" else "母号域名补号")
+                )
                 self._fail(operation, f"{label}结束:{detail}")
                 return
             upstream_result = (
@@ -378,7 +389,12 @@ class AutoReplacementService:
             )
             break
         else:
-            self._fail(operation, "母号域名补号等待超时")
+            self._fail(
+                operation,
+                "母号已注册补号等待超时"
+                if refill_mode == "registered_reuse"
+                else "母号域名补号等待超时",
+            )
             return
 
         if remove_only:

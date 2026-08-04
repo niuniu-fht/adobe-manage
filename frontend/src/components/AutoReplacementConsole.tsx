@@ -19,6 +19,7 @@ export function AutoReplacementConsole() {
   const [creditThreshold, setCreditThreshold] = useState("0");
   const [refreshMinutes, setRefreshMinutes] = useState("5");
   const [autoRefillEnabled, setAutoRefillEnabled] = useState(true);
+  const [refillMode, setRefillMode] = useState<"new_domain" | "registered_reuse">("new_domain");
   const [settingsDirty, setSettingsDirty] = useState(false);
   const query = useQuery({
     queryKey: ["auto-replacements"],
@@ -33,6 +34,7 @@ export function AutoReplacementConsole() {
       setCreditThreshold(String(query.data.settings.credit_threshold));
       setRefreshMinutes(String(query.data.settings.refresh_interval_minutes));
       setAutoRefillEnabled(Boolean(query.data.settings.enabled ?? true));
+      setRefillMode(query.data.settings.refill_mode === "registered_reuse" ? "registered_reuse" : "new_domain");
     }
   }, [query.data?.settings, settingsDirty]);
 
@@ -53,7 +55,8 @@ export function AutoReplacementConsole() {
         body: JSON.stringify({
           credit_threshold: threshold,
           refresh_interval_minutes: minutes,
-          enabled: autoRefillEnabled
+          enabled: autoRefillEnabled,
+          refill_mode: refillMode
         })
       });
     },
@@ -61,8 +64,10 @@ export function AutoReplacementConsole() {
       setCreditThreshold(String(payload.settings.credit_threshold));
       setRefreshMinutes(String(payload.settings.refresh_interval_minutes));
       setAutoRefillEnabled(Boolean(payload.settings.enabled ?? true));
+      setRefillMode(payload.settings.refill_mode === "registered_reuse" ? "registered_reuse" : "new_domain");
       setSettingsDirty(false);
-      emitToast(payload.settings.enabled ? "自动补号设置已保存，额度刷新已启动" : "已保存：异常账号移除后跳过后续补号", "success");
+      const modeText = payload.settings.refill_mode === "registered_reuse" ? "已注册补号" : "新注册补号";
+      emitToast(payload.settings.enabled ? `自动补号设置已保存，模式：${modeText}，额度刷新已启动` : "已保存：异常账号移除后跳过后续补号", "success");
       await queryClient.invalidateQueries({ queryKey: ["auto-replacements"] });
     },
     onError: (error) => emitToast(error.message, "error")
@@ -90,6 +95,7 @@ export function AutoReplacementConsole() {
       <label><span>额度刷新</span><input type="number" min="1" max="1440" step="1" value={refreshMinutes} onChange={(event) => { setRefreshMinutes(event.target.value); setSettingsDirty(true); }} /><b>分钟</b></label>
       <label><span>补号阈值</span><input type="number" min="0" step="1" value={creditThreshold} onChange={(event) => { setCreditThreshold(event.target.value); setSettingsDirty(true); }} /></label>
       <label className="auto-refill-toggle"><input type="checkbox" checked={autoRefillEnabled} onChange={(event) => { setAutoRefillEnabled(event.target.checked); setSettingsDirty(true); }} /><span>{autoRefillEnabled ? "补号开启" : "仅移除"}</span></label>
+      <label><span>补号方式</span><select value={refillMode} disabled={!autoRefillEnabled} onChange={(event) => { setRefillMode(event.target.value === "registered_reuse" ? "registered_reuse" : "new_domain"); setSettingsDirty(true); }}><option value="new_domain">新注册补号</option><option value="registered_reuse">已注册补号</option></select></label>
       <button className="icon-btn" title="保存自动补号设置" disabled={saveSettings.isPending || !settingsDirty} onClick={() => saveSettings.mutate()}><Save size={15} /></button>
       <small>{query.data?.credit_refresh.running ? "正在刷新额度" : `下次刷新 ${formatTime(query.data?.credit_refresh.next_refresh_at)}`}</small>
     </div>
