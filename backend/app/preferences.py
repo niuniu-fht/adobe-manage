@@ -12,10 +12,12 @@ AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY = "auto_replacement_credit_threshold"
 CREDITS_REFRESH_INTERVAL_MINUTES_KEY = "credits_refresh_interval_minutes"
 AUTO_REPLACEMENT_ENABLED_KEY = "auto_replacement_enabled"
 AUTO_REPLACEMENT_REFILL_MODE_KEY = "auto_replacement_refill_mode"
+AUTO_REPLACEMENT_CONCURRENCY_KEY = "auto_replacement_concurrency"
 DEFAULT_AUTO_REPLACEMENT_CREDIT_THRESHOLD = 0.0
 DEFAULT_CREDITS_REFRESH_INTERVAL_MINUTES = 5
 DEFAULT_AUTO_REPLACEMENT_ENABLED = True
 DEFAULT_AUTO_REPLACEMENT_REFILL_MODE = "new_domain"
+DEFAULT_AUTO_REPLACEMENT_CONCURRENCY = 3
 
 
 def normalize_low_credit_threshold(value: Any) -> float:
@@ -82,11 +84,20 @@ def normalize_auto_replacement_refill_mode(value: Any) -> str:
     return DEFAULT_AUTO_REPLACEMENT_REFILL_MODE
 
 
+def normalize_auto_replacement_concurrency(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_AUTO_REPLACEMENT_CONCURRENCY
+    return max(1, min(parsed, 10))
+
+
 def get_auto_replacement_settings(db: Session) -> dict[str, float | int | bool | str]:
     threshold = db.get(ManagerSetting, AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY)
     interval = db.get(ManagerSetting, CREDITS_REFRESH_INTERVAL_MINUTES_KEY)
     enabled = db.get(ManagerSetting, AUTO_REPLACEMENT_ENABLED_KEY)
     refill_mode = db.get(ManagerSetting, AUTO_REPLACEMENT_REFILL_MODE_KEY)
+    concurrency = db.get(ManagerSetting, AUTO_REPLACEMENT_CONCURRENCY_KEY)
     return {
         "credit_threshold": normalize_auto_replacement_credit_threshold(
             threshold.value
@@ -106,6 +117,11 @@ def get_auto_replacement_settings(db: Session) -> dict[str, float | int | bool |
             if refill_mode is not None
             else DEFAULT_AUTO_REPLACEMENT_REFILL_MODE
         ),
+        "concurrency": normalize_auto_replacement_concurrency(
+            concurrency.value
+            if concurrency is not None
+            else DEFAULT_AUTO_REPLACEMENT_CONCURRENCY
+        ),
     }
 
 
@@ -116,6 +132,7 @@ def set_auto_replacement_settings(
     refresh_interval_minutes: Any,
     enabled: Any = DEFAULT_AUTO_REPLACEMENT_ENABLED,
     refill_mode: Any = DEFAULT_AUTO_REPLACEMENT_REFILL_MODE,
+    concurrency: Any = DEFAULT_AUTO_REPLACEMENT_CONCURRENCY,
 ) -> dict[str, float | int | bool | str]:
     values = {
         AUTO_REPLACEMENT_CREDIT_THRESHOLD_KEY:
@@ -124,6 +141,7 @@ def set_auto_replacement_settings(
             normalize_credits_refresh_interval_minutes(refresh_interval_minutes),
         AUTO_REPLACEMENT_ENABLED_KEY: normalize_auto_replacement_enabled(enabled),
         AUTO_REPLACEMENT_REFILL_MODE_KEY: normalize_auto_replacement_refill_mode(refill_mode),
+        AUTO_REPLACEMENT_CONCURRENCY_KEY: normalize_auto_replacement_concurrency(concurrency),
     }
     for key, value in values.items():
         row = db.get(ManagerSetting, key)
@@ -137,6 +155,7 @@ def set_auto_replacement_settings(
         "refresh_interval_minutes": values[CREDITS_REFRESH_INTERVAL_MINUTES_KEY],
         "enabled": values[AUTO_REPLACEMENT_ENABLED_KEY],
         "refill_mode": values[AUTO_REPLACEMENT_REFILL_MODE_KEY],
+        "concurrency": values[AUTO_REPLACEMENT_CONCURRENCY_KEY],
     }
 
 
@@ -215,6 +234,14 @@ def seed_manager_settings(db: Session) -> None:
             ManagerSetting(
                 key=AUTO_REPLACEMENT_REFILL_MODE_KEY,
                 value=DEFAULT_AUTO_REPLACEMENT_REFILL_MODE,
+            )
+        )
+        changed = True
+    if db.get(ManagerSetting, AUTO_REPLACEMENT_CONCURRENCY_KEY) is None:
+        db.add(
+            ManagerSetting(
+                key=AUTO_REPLACEMENT_CONCURRENCY_KEY,
+                value=DEFAULT_AUTO_REPLACEMENT_CONCURRENCY,
             )
         )
         changed = True

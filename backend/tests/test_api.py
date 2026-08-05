@@ -324,7 +324,13 @@ def test_auto_replacement_settings_are_persisted_and_force_credit_refresh(
     response = client.put(
         "/api/auto-replacements/settings",
         headers=headers,
-        json={"credit_threshold": 750, "refresh_interval_minutes": 12, "enabled": False},
+        json={
+            "credit_threshold": 750,
+            "refresh_interval_minutes": 12,
+            "enabled": False,
+            "refill_mode": "registered_reuse",
+            "concurrency": 4,
+        },
     )
     settings_response = client.get("/api/settings")
 
@@ -333,11 +339,15 @@ def test_auto_replacement_settings_are_persisted_and_force_credit_refresh(
         "credit_threshold": 750.0,
         "refresh_interval_minutes": 12,
         "enabled": False,
+        "refill_mode": "registered_reuse",
+        "concurrency": 4,
     }
     assert settings_response.json()["auto_replacement"] == {
         "credit_threshold": 750.0,
         "refresh_interval_minutes": 12,
         "enabled": False,
+        "refill_mode": "registered_reuse",
+        "concurrency": 4,
     }
     assert polls == [True]
     with SessionLocal() as db:
@@ -348,6 +358,8 @@ def test_auto_replacement_settings_are_persisted_and_force_credit_refresh(
             "credit_threshold": 750.0,
             "refresh_interval_minutes": 12,
             "enabled": False,
+            "refill_mode": "registered_reuse",
+            "concurrency": 4,
         }
 
 

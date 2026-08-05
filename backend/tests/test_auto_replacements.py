@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 
 from app.auto_replacements import AutoReplacementOperation, AutoReplacementService
 from app.polling import FleetPoller
@@ -66,9 +67,10 @@ def test_auto_replacement_deletes_local_before_one_shot_domain_job(
             {},
         )
 
-    async def fake_start(email):
+    async def fake_start(email, **kwargs):
         calls.append("taem-start")
         assert email == "old@example.com"
+        assert kwargs == {"source": "new_domain"}
         return {"id": 73, "status": "running"}
 
     async def fake_get_job(job_id, *, log_offset=0):
@@ -92,6 +94,16 @@ def test_auto_replacement_deletes_local_before_one_shot_domain_job(
     monkeypatch.setattr(remote_client, "request", fake_request)
     monkeypatch.setattr(taem_client, "start_replace_member_domain", fake_start)
     monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {
+            "credit_threshold": 100.0,
+            "refresh_interval_minutes": 5,
+            "enabled": True,
+            "refill_mode": "new_domain",
+            "concurrency": 3,
+        },
+    )
 
     asyncio.run(service._process(operation))
 
@@ -188,6 +200,62 @@ def test_auto_replacement_latches_zero_credit_and_credential_errors_once():
         "积分为 0",
         "凭证异常",
     }
+
+
+def test_auto_replacement_dispatcher_respects_configured_concurrency(monkeypatch):
+    service = AutoReplacementService()
+
+    async def run():
+        service._queue = asyncio.Queue()
+        monkeypatch.setattr(service, "_configured_concurrency", lambda: 2)
+        release = asyncio.Event()
+        two_running = asyncio.Event()
+        running = 0
+
+        async def fake_process(operation):
+            nonlocal running
+            operation.status = "running"
+            running += 1
+            if running == 2:
+                two_running.set()
+            await release.wait()
+            running -= 1
+            operation.status = "done"
+            operation.phase = "complete"
+
+        monkeypatch.setattr(service, "_process", fake_process)
+        operations = [
+            AutoReplacementOperation(
+                instance_id="east",
+                instance_name="East",
+                base_url="https://east.example",
+                profile_id=f"profile-{index}",
+                source_email=f"user{index}@example.com",
+                trigger="凭证异常",
+                credits_available=None,
+                health="credential_error",
+            )
+            for index in range(3)
+        ]
+        service._operations = {item.id: item for item in operations}
+        for operation in operations:
+            service._queue.put_nowait(operation)
+        dispatcher = asyncio.create_task(service._run())
+        try:
+            await asyncio.wait_for(two_running.wait(), timeout=1)
+            snapshot = service.snapshot()
+            assert snapshot["active_count"] == 2
+            assert snapshot["queued"] == 1
+            assert len(snapshot["active_ids"]) == 2
+            release.set()
+            await asyncio.wait_for(service._queue.join(), timeout=1)
+            assert service.snapshot()["active_count"] == 0
+        finally:
+            dispatcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await dispatcher
+
+    asyncio.run(run())
 
 
 def test_auto_replacement_queues_positive_credit_below_configured_threshold():

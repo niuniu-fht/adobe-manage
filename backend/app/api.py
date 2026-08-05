@@ -688,6 +688,7 @@ async def update_auto_replacement_settings(
         refresh_interval_minutes=payload.refresh_interval_minutes,
         enabled=payload.enabled,
         refill_mode=payload.refill_mode,
+        concurrency=payload.concurrency,
     )
     _record_audit(
         db,

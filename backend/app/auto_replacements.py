@@ -13,7 +13,6 @@ from .database import SessionLocal
 from .models import ManagerSetting
 from .preferences import get_auto_replacement_settings
 from .remote import RemoteError, remote_client
-from .replacement_coordinator import replacement_coordinator
 from .taem import TaemError, taem_client
 
 
@@ -80,11 +79,12 @@ class AutoReplacementOperation:
 class AutoReplacementService:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
+        self._running_tasks: set[asyncio.Task] = set()
         self._stop: Optional[asyncio.Event] = None
         self._queue: asyncio.Queue[AutoReplacementOperation] | None = None
         self._operations: dict[str, AutoReplacementOperation] = {}
         self._latched: set[str] = set()
-        self._active_id = ""
+        self._active_ids: set[str] = set()
         self._lock = threading.RLock()
 
     def start(self) -> None:
@@ -92,7 +92,7 @@ class AutoReplacementService:
             self._stop = asyncio.Event()
             self._queue = asyncio.Queue()
             self._task = asyncio.create_task(
-                self._run(), name="auto-domain-replacement-worker"
+                self._run(), name="auto-domain-replacement-dispatcher"
             )
 
     async def stop(self) -> None:
@@ -102,6 +102,11 @@ class AutoReplacementService:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._task
+        for task in list(self._running_tasks):
+            task.cancel()
+        if self._running_tasks:
+            await asyncio.gather(*self._running_tasks, return_exceptions=True)
+        self._running_tasks.clear()
         self._task = None
         self._stop = None
         self._queue = None
@@ -188,7 +193,7 @@ class AutoReplacementService:
                 operation.add_log(
                     f"自动触发 [{instance_name}] {email}: {operation.trigger}"
                 )
-                operation.add_log("已进入串行队列，等待前序补号任务结束")
+                operation.add_log("已进入并发队列，等待可用补号并发槽")
                 self._operations[operation.id] = operation
                 self._trim_locked()
             queue = self._queue
@@ -207,9 +212,18 @@ class AutoReplacementService:
                 key=lambda item: item.created_at,
                 reverse=True,
             )[:50]
+            active_ids = [
+                item.id
+                for item in sorted(
+                    self._operations.values(), key=lambda item: item.created_at
+                )
+                if item.id in self._active_ids
+            ]
             return {
-                "active_id": self._active_id or None,
-                "active": bool(self._active_id),
+                "active_id": active_ids[0] if active_ids else None,
+                "active_ids": active_ids,
+                "active": bool(active_ids),
+                "active_count": len(active_ids),
                 "queued": self._queue.qsize() if self._queue is not None else 0,
                 "operations": [item.snapshot() for item in operations],
             }
@@ -218,7 +232,7 @@ class AutoReplacementService:
         with self._lock:
             self._operations.clear()
             self._latched.clear()
-            self._active_id = ""
+            self._active_ids.clear()
         queue = self._queue
         while queue is not None:
             try:
@@ -232,28 +246,50 @@ class AutoReplacementService:
         if queue is None:
             return
         while True:
+            await self._wait_for_slot()
             operation = await queue.get()
-            owner = f"auto:{operation.id}"
+            with self._lock:
+                self._active_ids.add(operation.id)
+            task = asyncio.create_task(
+                self._run_operation(operation, queue),
+                name=f"auto-domain-replacement-{operation.id}",
+            )
+            self._running_tasks.add(task)
+            task.add_done_callback(self._running_tasks.discard)
+
+    async def _wait_for_slot(self) -> None:
+        while True:
+            self._discard_done_tasks()
+            concurrency = self._configured_concurrency()
+            with self._lock:
+                active_count = len(self._active_ids)
+            if active_count < concurrency:
+                return
+            await asyncio.sleep(0.5)
+
+    def _discard_done_tasks(self) -> None:
+        for task in list(self._running_tasks):
+            if task.done():
+                self._running_tasks.discard(task)
+
+    async def _run_operation(
+        self,
+        operation: AutoReplacementOperation,
+        queue: asyncio.Queue[AutoReplacementOperation],
+    ) -> None:
+        try:
+            concurrency = self._configured_concurrency()
+            operation.add_log(f"已获取并发槽，当前并发上限 {concurrency}")
             try:
-                wait_logged = False
-                while not replacement_coordinator.try_acquire(owner):
-                    if not wait_logged:
-                        operation.add_log("另一个移除补号流程正在运行，继续排队")
-                        wait_logged = True
-                    await asyncio.sleep(2)
-                with self._lock:
-                    self._active_id = operation.id
                 await self._process(operation)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._fail(operation, f"自动补号任务异常:{exc}")
-            finally:
-                replacement_coordinator.release(owner)
-                with self._lock:
-                    if self._active_id == operation.id:
-                        self._active_id = ""
-                queue.task_done()
+        finally:
+            with self._lock:
+                self._active_ids.discard(operation.id)
+            queue.task_done()
 
     async def _process(self, operation: AutoReplacementOperation) -> None:
         operation.status = "running"
@@ -583,6 +619,15 @@ class AutoReplacementService:
                 row.value = dict(guards)
                 row.updated_at = time.time()
             db.commit()
+
+    @staticmethod
+    def _configured_concurrency() -> int:
+        try:
+            with SessionLocal() as db:
+                value = get_auto_replacement_settings(db).get("concurrency", 3)
+            return max(1, min(int(value or 3), 10))
+        except Exception:
+            return 3
 
     def _guard_zero_credit(self, email: str) -> None:
         normalized = str(email or "").strip().lower()

@@ -197,7 +197,9 @@ export interface AutoReplacementOperation {
 
 export interface AutoReplacementsResponse {
   active_id?: string | null;
+  active_ids?: string[];
   active: boolean;
+  active_count?: number;
   queued: number;
   operations: AutoReplacementOperation[];
   settings: {
@@ -205,6 +207,7 @@ export interface AutoReplacementsResponse {
     refresh_interval_minutes: number;
     enabled: boolean;
     refill_mode: "new_domain" | "registered_reuse";
+    concurrency: number;
   };
   credit_refresh: {
     running: boolean;

@@ -74,6 +74,7 @@ class AutoReplacementSettingsUpdate(BaseModel):
     refresh_interval_minutes: int = Field(ge=1, le=1440)
     enabled: bool = True
     refill_mode: str = "new_domain"
+    concurrency: int = Field(default=3, ge=1, le=10)
 
     @field_validator("refill_mode")
     @classmethod
