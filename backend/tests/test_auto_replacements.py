@@ -258,6 +258,112 @@ def test_auto_replacement_dispatcher_respects_configured_concurrency(monkeypatch
     asyncio.run(run())
 
 
+def test_auto_replacement_reuses_same_source_replacement_for_parallel_instances(monkeypatch):
+    service = AutoReplacementService()
+    secret = "SHARED_COOKIE"
+    calls: list[str] = []
+
+    operations = [
+        AutoReplacementOperation(
+            instance_id=f"inst-{index}",
+            instance_name=f"Instance {index}",
+            base_url=f"https://inst-{index}.example",
+            profile_id=f"profile-{index}",
+            source_email="shared@example.com",
+            trigger="凭证异常",
+            credits_available=100,
+            health="credential_error",
+            credit_threshold=0,
+        )
+        for index in range(2)
+    ]
+
+    async def fake_accounts(base_url, _threshold):
+        index = base_url.split("-")[-1].split(".")[0]
+        return {
+            "items": [
+                {
+                    "id": f"profile-{index}",
+                    "email": "shared@example.com",
+                    "enabled": True,
+                    "health": "credential_error",
+                    "credits_available": 100,
+                }
+            ]
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        if path.endswith("delete-batch"):
+            calls.append("delete")
+            return RemoteResponse(
+                200,
+                {
+                    "status": "ok",
+                    "deleted_count": 1,
+                    "deleted_ids": list(kwargs["json"]["ids"]),
+                },
+                {},
+            )
+        calls.append("import")
+        assert kwargs["json"]["items"][0]["cookie"]["cookie"] == secret
+        return RemoteResponse(
+            200,
+            {"status": "ok", "imported_count": 1, "refresh_failed_count": 0},
+            {},
+        )
+
+    async def fake_start(email, **kwargs):
+        calls.append("taem-start")
+        assert email == "shared@example.com"
+        return {"id": 99, "status": "running"}
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        calls.append("taem-job")
+        assert job_id == 99
+        return {
+            "id": 99,
+            "status": "done",
+            "log_total": 0,
+            "logs": [],
+            "result": {
+                "replacement": {
+                    "email": "new-shared@code2alita.com",
+                    "cookie": secret,
+                }
+            },
+        }
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_replace_member_domain", fake_start)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {
+            "credit_threshold": 0.0,
+            "refresh_interval_minutes": 5,
+            "enabled": True,
+            "refill_mode": "new_domain",
+            "concurrency": 2,
+        },
+    )
+
+    async def run():
+        await asyncio.gather(*(service._process(operation) for operation in operations))
+
+    asyncio.run(run())
+
+    assert calls.count("delete") == 2
+    assert calls.count("taem-start") == 1
+    assert calls.count("taem-job") == 1
+    assert calls.count("import") == 2
+    assert all(operation.status == "done" for operation in operations)
+    assert all(
+        operation.replacement_email == "new-shared@code2alita.com"
+        for operation in operations
+    )
+
+
 def test_auto_replacement_queues_positive_credit_below_configured_threshold():
     service = AutoReplacementService()
 

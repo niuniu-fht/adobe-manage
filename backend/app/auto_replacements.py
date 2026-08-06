@@ -17,6 +17,8 @@ from .taem import TaemError, taem_client
 
 
 AUTO_TERMINAL_STATUSES = {"done", "partial", "failed", "skipped"}
+SOURCE_REPLACEMENT_CACHE_SECONDS = 1800
+FAILED_RETRY_COOLDOWN_SECONDS = 300
 
 
 @dataclass
@@ -85,6 +87,9 @@ class AutoReplacementService:
         self._operations: dict[str, AutoReplacementOperation] = {}
         self._latched: set[str] = set()
         self._active_ids: set[str] = set()
+        self._source_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._source_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._retry_after: dict[str, float] = {}
         self._lock = threading.RLock()
 
     def start(self) -> None:
@@ -174,8 +179,14 @@ class AutoReplacementService:
             if not triggers:
                 with self._lock:
                     self._latched.discard(key)
+                    self._retry_after.pop(key, None)
                 continue
             with self._lock:
+                retry_at = float(self._retry_after.get(key) or 0)
+                if retry_at and time.time() < retry_at:
+                    continue
+                if retry_at:
+                    self._retry_after.pop(key, None)
                 if key in self._latched:
                     continue
                 self._latched.add(key)
@@ -233,6 +244,9 @@ class AutoReplacementService:
             self._operations.clear()
             self._latched.clear()
             self._active_ids.clear()
+            self._source_tasks.clear()
+            self._source_cache.clear()
+            self._retry_after.clear()
         queue = self._queue
         while queue is not None:
             try:
@@ -376,63 +390,25 @@ class AutoReplacementService:
 
         operation.phase = "mother_replacement"
         try:
-            upstream = (
-                await taem_client.start_remove_member_only(operation.source_email)
-                if remove_only
-                else await taem_client.start_replace_member_domain(
-                    operation.source_email,
-                    source=refill_mode,
-                )
+            mother_result = await self._mother_result_for_source(
+                operation,
+                remove_only=remove_only,
+                refill_mode=refill_mode,
             )
-            operation.upstream_job_id = int(upstream.get("id"))
-        except (TaemError, TypeError, ValueError) as exc:
-            self._fail(operation, f"启动母号域名补号失败:{exc}")
-            return
-        operation.add_log(f"母号任务 #{operation.upstream_job_id} 已启动")
-        offset = 0
-        deadline = time.monotonic() + settings.taem_timeout_seconds
-        upstream_result: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            try:
-                upstream = await taem_client.get_job(
-                    operation.upstream_job_id,
-                    log_offset=offset,
-                )
-            except TaemError as exc:
-                self._fail(operation, f"读取母号任务失败:{exc}")
-                return
-            logs = upstream.get("logs") if isinstance(upstream.get("logs"), list) else []
-            for line in logs:
-                operation.add_log(str(line))
-            offset = max(offset + len(logs), int(upstream.get("log_total") or 0))
-            upstream_status = str(upstream.get("status") or "running")
-            if upstream_status == "running":
-                await asyncio.sleep(2)
-                continue
-            if upstream_status != "done":
-                detail = str(upstream.get("error") or f"任务状态:{upstream_status}")
-                label = (
-                    "母号仅移除流程"
-                    if remove_only
-                    else ("母号已注册补号" if refill_mode == "registered_reuse" else "母号域名补号")
-                )
-                self._fail(operation, f"{label}结束:{detail}")
-                return
+            operation.upstream_job_id = int(mother_result.get("upstream_job_id") or 0) or None
             upstream_result = (
-                upstream.get("result")
-                if isinstance(upstream.get("result"), dict)
+                mother_result.get("upstream_result")
+                if isinstance(mother_result.get("upstream_result"), dict)
                 else {}
             )
-            break
-        else:
-            self._fail(
-                operation,
-                "母号已注册补号等待超时"
-                if refill_mode == "registered_reuse"
-                else "母号域名补号等待超时",
-            )
+        except (TaemError, TypeError, ValueError, RuntimeError) as exc:
+            self._fail(operation, f"启动母号域名补号失败:{exc}")
             return
-
+        if mother_result.get("shared"):
+            operation.add_log(
+                f"同邮箱母号补号结果已复用"
+                + (f":任务 #{operation.upstream_job_id}" if operation.upstream_job_id else "")
+            )
         if remove_only:
             operation.phase = "complete"
             operation.status = "done"
@@ -504,6 +480,117 @@ class AutoReplacementService:
             operation.add_log("新 Cookie 已导入，但实例首次凭证刷新失败")
         else:
             operation.add_log("自动移除、一次性域名补号和 Cookie 回写全部完成")
+
+    async def _mother_result_for_source(
+        self,
+        operation: AutoReplacementOperation,
+        *,
+        remove_only: bool,
+        refill_mode: str,
+    ) -> dict[str, Any]:
+        source_email = operation.source_email.strip().lower()
+        now = time.time()
+        with self._lock:
+            cached = self._source_cache.get(source_email)
+            if cached and now - cached[0] <= SOURCE_REPLACEMENT_CACHE_SECONDS:
+                return {**cached[1], "shared": True}
+            task = self._source_tasks.get(source_email)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._run_mother_replacement(operation, remove_only, refill_mode),
+                    name=f"auto-mother-replacement-{source_email}",
+                )
+                self._source_tasks[source_email] = task
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            operation.add_log(
+                "同邮箱已有母号补号任务运行中，等待结果并复用，避免重复按旧子号移除"
+            )
+        try:
+            result = await task
+        except Exception:
+            with self._lock:
+                if self._source_tasks.get(source_email) is task:
+                    self._source_tasks.pop(source_email, None)
+            raise
+        with self._lock:
+            if self._source_tasks.get(source_email) is task:
+                self._source_tasks.pop(source_email, None)
+            if not remove_only and result.get("replacement_cookie"):
+                self._source_cache[source_email] = (time.time(), dict(result))
+            self._trim_source_cache_locked()
+        if not leader:
+            return {**result, "shared": True}
+        return result
+
+    async def _run_mother_replacement(
+        self,
+        operation: AutoReplacementOperation,
+        remove_only: bool,
+        refill_mode: str,
+    ) -> dict[str, Any]:
+        upstream = (
+            await taem_client.start_remove_member_only(operation.source_email)
+            if remove_only
+            else await taem_client.start_replace_member_domain(
+                operation.source_email,
+                source=refill_mode,
+            )
+        )
+        upstream_job_id = int(upstream.get("id"))
+        operation.add_log(f"母号任务 #{upstream_job_id} 已启动")
+        offset = 0
+        deadline = time.monotonic() + settings.taem_timeout_seconds
+        upstream_result: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            try:
+                upstream = await taem_client.get_job(
+                    upstream_job_id,
+                    log_offset=offset,
+                )
+            except TaemError as exc:
+                raise RuntimeError(f"读取母号任务失败:{exc}") from exc
+            logs = upstream.get("logs") if isinstance(upstream.get("logs"), list) else []
+            for line in logs:
+                operation.add_log(str(line))
+            offset = max(offset + len(logs), int(upstream.get("log_total") or 0))
+            upstream_status = str(upstream.get("status") or "running")
+            if upstream_status == "running":
+                await asyncio.sleep(2)
+                continue
+            if upstream_status != "done":
+                detail = str(upstream.get("error") or f"任务状态:{upstream_status}")
+                label = (
+                    "母号仅移除流程"
+                    if remove_only
+                    else ("母号已注册补号" if refill_mode == "registered_reuse" else "母号域名补号")
+                )
+                raise RuntimeError(f"{label}结束:{detail}")
+            upstream_result = (
+                upstream.get("result")
+                if isinstance(upstream.get("result"), dict)
+                else {}
+            )
+            break
+        else:
+            raise RuntimeError(
+                "母号已注册补号等待超时"
+                if refill_mode == "registered_reuse"
+                else "母号域名补号等待超时",
+            )
+        replacement = (
+            upstream_result.get("replacement")
+            if isinstance(upstream_result.get("replacement"), dict)
+            else {}
+        )
+        return {
+            "upstream_job_id": upstream_job_id,
+            "upstream_result": upstream_result,
+            "replacement_email": str(replacement.get("email") or "").strip().lower(),
+            "replacement_cookie": str(replacement.get("cookie") or "").strip(),
+        }
 
     @staticmethod
     def _error_trigger(item: dict[str, Any]) -> str:
@@ -578,12 +665,16 @@ class AutoReplacementService:
             return attempted
         return set()
 
-    @staticmethod
-    def _fail(operation: AutoReplacementOperation, message: str) -> None:
+    def _fail(self, operation: AutoReplacementOperation, message: str) -> None:
         operation.status = "failed"
         operation.phase = "failed"
         operation.error = str(message or "")[:500]
         operation.add_log(operation.error)
+        with self._lock:
+            self._latched.discard(operation.latch_key)
+            self._retry_after[operation.latch_key] = (
+                time.time() + FAILED_RETRY_COOLDOWN_SECONDS
+            )
 
     @staticmethod
     def _zero_credit_guards() -> dict[str, float]:
@@ -650,6 +741,22 @@ class AutoReplacementService:
         )
         for item in finished[: len(self._operations) - 100]:
             self._operations.pop(item.id, None)
+
+    def _trim_source_cache_locked(self) -> None:
+        now = time.time()
+        expired = [
+            email
+            for email, (created_at, _result) in self._source_cache.items()
+            if now - created_at > SOURCE_REPLACEMENT_CACHE_SECONDS
+        ]
+        for email in expired:
+            self._source_cache.pop(email, None)
+        if len(self._source_cache) <= 200:
+            return
+        for email, _item in sorted(
+            self._source_cache.items(), key=lambda item: item[1][0]
+        )[: len(self._source_cache) - 200]:
+            self._source_cache.pop(email, None)
 
 
 auto_replacement_service = AutoReplacementService()
