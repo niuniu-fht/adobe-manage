@@ -412,6 +412,14 @@ class AutoReplacementService:
                 f"同邮箱母号补号结果已复用"
                 + (f":任务 #{operation.upstream_job_id}" if operation.upstream_job_id else "")
             )
+        if mother_result.get("source_missing"):
+            operation.phase = "complete"
+            operation.status = "done"
+            operation.remove_only = True
+            operation.add_log("母号侧未找到该子号，实例本地账号已移除，本次直接结束")
+            with self._lock:
+                self._latched.discard(operation.latch_key)
+            return
         if remove_only:
             operation.phase = "complete"
             operation.status = "done"
@@ -571,6 +579,15 @@ class AutoReplacementService:
                 )
             except TaemError as exc:
                 last_error = str(exc)[:240]
+                if self._is_source_missing_error(last_error):
+                    operation.add_log(f"{label}未启动:{last_error}，母号侧已不存在该子号")
+                    return {
+                        "upstream_job_id": None,
+                        "upstream_result": {},
+                        "replacement_email": "",
+                        "replacement_cookie": "",
+                        "source_missing": True,
+                    }
                 delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
                 operation.add_log(
                     f"{label}暂未启动:{last_error}，{delay:g} 秒后继续重试"
@@ -659,6 +676,12 @@ class AutoReplacementService:
                 else "母号域名补号等待超时"
             )
         )
+
+    @staticmethod
+    def _is_source_missing_error(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        return "未找到子号" in text or "child account not found" in text
+
 
     @staticmethod
     def _error_trigger(item: dict[str, Any]) -> str:

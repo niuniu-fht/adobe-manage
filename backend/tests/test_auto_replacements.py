@@ -116,6 +116,76 @@ def test_auto_replacement_deletes_local_before_one_shot_domain_job(
 
 
 
+
+def test_auto_replacement_completes_when_mother_child_is_missing(monkeypatch):
+    service = AutoReplacementService()
+    operation = AutoReplacementOperation(
+        instance_id="east",
+        instance_name="East",
+        base_url="https://east.example",
+        profile_id="profile-old",
+        source_email="missing@example.com",
+        trigger="凭证异常",
+        credits_available=None,
+        health="credential_error",
+        credit_threshold=0,
+    )
+    calls: list[str] = []
+
+    async def fake_accounts(_base_url, _threshold):
+        return {
+            "items": [
+                {
+                    "id": "profile-old",
+                    "email": "missing@example.com",
+                    "enabled": True,
+                    "health": "credential_error",
+                }
+            ]
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        if path.endswith("delete-batch"):
+            calls.append("delete")
+            return RemoteResponse(
+                200,
+                {"status": "ok", "deleted_count": 1, "deleted_ids": ["profile-old"]},
+                {},
+            )
+        calls.append("import")
+        raise AssertionError("missing child should not import a replacement cookie")
+
+    async def fake_start(email, **kwargs):
+        calls.append("taem-start")
+        raise TaemError("未找到子号:missing@example.com", status_code=404)
+
+    async def fake_sleep(_seconds):
+        calls.append("sleep")
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_replace_member_domain", fake_start)
+    monkeypatch.setattr("app.auto_replacements.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {
+            "credit_threshold": 0.0,
+            "refresh_interval_minutes": 5,
+            "enabled": True,
+            "refill_mode": "registered_reuse",
+            "concurrency": 3,
+        },
+    )
+
+    asyncio.run(service._process(operation))
+
+    assert calls == ["delete", "taem-start"]
+    assert operation.status == "done"
+    assert operation.phase == "complete"
+    assert operation.remove_only is True
+    assert "直接结束" in "\n".join(operation.logs)
+
+
 def test_auto_replacement_retries_when_mother_admin_has_running_job(monkeypatch):
     service = AutoReplacementService()
     operation = AutoReplacementOperation(
