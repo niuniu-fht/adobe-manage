@@ -19,9 +19,14 @@ from .taem import TaemError, taem_client
 AUTO_TERMINAL_STATUSES = {"done", "partial", "failed", "skipped"}
 SOURCE_REPLACEMENT_CACHE_SECONDS = 1800
 FAILED_RETRY_COOLDOWN_SECONDS = 300
+MOTHER_BUSY_REQUEUE_SECONDS = 3
 MOTHER_RETRY_SECONDS = 12
 IMPORT_RETRY_SECONDS = 5
 IMPORT_RETRY_ATTEMPTS = 5
+
+
+class MotherBusyDefer(RuntimeError):
+    pass
 
 
 @dataclass
@@ -301,6 +306,12 @@ class AutoReplacementService:
                 await self._process(operation)
             except asyncio.CancelledError:
                 raise
+            except MotherBusyDefer as exc:
+                operation.status = "queued"
+                operation.phase = "mother_waiting"
+                operation.add_log(f"{exc}，释放并发槽并重新排队")
+                await asyncio.sleep(MOTHER_BUSY_REQUEUE_SECONDS)
+                queue.put_nowait(operation)
             except Exception as exc:  # noqa: BLE001
                 self._fail(operation, f"自动补号任务异常:{exc}")
         finally:
@@ -309,68 +320,75 @@ class AutoReplacementService:
             queue.task_done()
 
     async def _process(self, operation: AutoReplacementOperation) -> None:
+        resume_after_local_removal = operation.phase in {
+            "mother_replacement",
+            "mother_waiting",
+        }
         operation.status = "running"
-        operation.phase = "checking"
-        operation.add_log("开始复核实例账号状态")
-        try:
-            data = await remote_client.accounts(operation.base_url, 0)
-        except RemoteError as exc:
-            self._fail(operation, f"复核实例账号失败:{exc}")
-            return
-        current = next(
-            (
-                item
-                for item in (data.get("items") or [])
-                if isinstance(item, dict)
-                and str(item.get("id") or "").strip() == operation.profile_id
-            ),
-            None,
-        )
-        if current is None:
-            operation.status = "skipped"
-            operation.phase = "complete"
-            operation.add_log("实例中已找不到该账号，本次跳过")
-            return
-        current_health = str(current.get("health") or "").strip().lower()
-        current_credits = self._optional_float(current.get("credits_available"))
-        current_error_trigger = self._error_trigger(current)
-        still_invalid = (
-            current_health == "credential_error"
-            or bool(current_error_trigger)
-            or current_credits == 0
-            or (
-                current_credits is not None
-                and operation.credit_threshold > 0
-                and current_credits < operation.credit_threshold
+        if resume_after_local_removal:
+            operation.add_log("继续母号补号流程，实例本地账号此前已移除")
+        else:
+            operation.phase = "checking"
+            operation.add_log("开始复核实例账号状态")
+            try:
+                data = await remote_client.accounts(operation.base_url, 0)
+            except RemoteError as exc:
+                self._fail(operation, f"复核实例账号失败:{exc}")
+                return
+            current = next(
+                (
+                    item
+                    for item in (data.get("items") or [])
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "").strip() == operation.profile_id
+                ),
+                None,
             )
-        )
-        if not still_invalid:
-            operation.status = "skipped"
-            operation.phase = "complete"
-            operation.add_log("账号状态已恢复，本次不执行移除")
-            with self._lock:
-                self._latched.discard(operation.latch_key)
-            return
+            if current is None:
+                operation.status = "skipped"
+                operation.phase = "complete"
+                operation.add_log("实例中已找不到该账号，本次跳过")
+                return
+            current_health = str(current.get("health") or "").strip().lower()
+            current_credits = self._optional_float(current.get("credits_available"))
+            current_error_trigger = self._error_trigger(current)
+            still_invalid = (
+                current_health == "credential_error"
+                or bool(current_error_trigger)
+                or current_credits == 0
+                or (
+                    current_credits is not None
+                    and operation.credit_threshold > 0
+                    and current_credits < operation.credit_threshold
+                )
+            )
+            if not still_invalid:
+                operation.status = "skipped"
+                operation.phase = "complete"
+                operation.add_log("账号状态已恢复，本次不执行移除")
+                with self._lock:
+                    self._latched.discard(operation.latch_key)
+                return
 
-        operation.phase = "local_removal"
-        operation.add_log("先从 Adobe 实例移除当前 Cookie 账号")
-        try:
-            response = await remote_client.request(
-                operation.base_url,
-                "POST",
-                "/api/v1/refresh-profiles/delete-batch",
-                json={"ids": [operation.profile_id]},
-                timeout=180,
-            )
-        except RemoteError as exc:
-            self._fail(operation, f"实例本地移除失败:{exc}")
-            return
-        delete_data = response.data if isinstance(response.data, dict) else {}
-        if operation.profile_id not in self._confirmed_removed_ids(
-            delete_data, [operation.profile_id]
-        ):
-            self._fail(operation, "实例未确认当前账号已移除，远端母号流程未启动")
-            return
+            operation.phase = "local_removal"
+            operation.add_log("先从 Adobe 实例移除当前 Cookie 账号")
+            try:
+                response = await remote_client.request(
+                    operation.base_url,
+                    "POST",
+                    "/api/v1/refresh-profiles/delete-batch",
+                    json={"ids": [operation.profile_id]},
+                    timeout=180,
+                )
+            except RemoteError as exc:
+                self._fail(operation, f"实例本地移除失败:{exc}")
+                return
+            delete_data = response.data if isinstance(response.data, dict) else {}
+            if operation.profile_id not in self._confirmed_removed_ids(
+                delete_data, [operation.profile_id]
+            ):
+                self._fail(operation, "实例未确认当前账号已移除，远端母号流程未启动")
+                return
         with SessionLocal() as db:
             auto_settings = get_auto_replacement_settings(db)
         auto_refill_enabled = bool(auto_settings.get("enabled", True))
@@ -404,6 +422,8 @@ class AutoReplacementService:
                 if isinstance(mother_result.get("upstream_result"), dict)
                 else {}
             )
+        except MotherBusyDefer:
+            raise
         except (TaemError, TypeError, ValueError, RuntimeError) as exc:
             self._fail(operation, f"母号补号持续重试后仍未完成:{exc}")
             return
@@ -588,6 +608,8 @@ class AutoReplacementService:
                         "replacement_cookie": "",
                         "source_missing": True,
                     }
+                if self._is_mother_busy_error(last_error):
+                    raise MotherBusyDefer(f"{label}暂未启动:{last_error}") from exc
                 delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
                 operation.add_log(
                     f"{label}暂未启动:{last_error}，{delay:g} 秒后继续重试"
@@ -696,6 +718,18 @@ class AutoReplacementService:
                 else "母号域名补号等待超时"
             )
         )
+
+    @staticmethod
+    def _is_mother_busy_error(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        return (
+            "已有移除补号任务" in text
+            or "已有拉号任务" in text
+            or "单任务执行" in text
+            or "another replacement" in text
+            or "job is running" in text
+        )
+
 
     @staticmethod
     def _is_source_missing_error(message: str) -> bool:

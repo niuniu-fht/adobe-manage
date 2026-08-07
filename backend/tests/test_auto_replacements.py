@@ -270,7 +270,7 @@ def test_auto_replacement_completes_when_mother_member_is_missing_in_job(monkeyp
     assert "直接结束" in "\n".join(operation.logs)
 
 
-def test_auto_replacement_retries_when_mother_admin_has_running_job(monkeypatch):
+def test_auto_replacement_requeues_when_mother_admin_has_running_job(monkeypatch):
     service = AutoReplacementService()
     operation = AutoReplacementOperation(
         instance_id="east",
@@ -353,7 +353,18 @@ def test_auto_replacement_retries_when_mother_admin_has_running_job(monkeypatch)
         },
     )
 
-    asyncio.run(service._process(operation))
+    async def run():
+        queue: asyncio.Queue[AutoReplacementOperation] = asyncio.Queue()
+        queue.put_nowait(operation)
+        first = queue.get_nowait()
+        await service._run_operation(first, queue)
+        assert operation.status == "queued"
+        assert operation.phase == "mother_waiting"
+        assert queue.qsize() == 1
+        second = queue.get_nowait()
+        await service._run_operation(second, queue)
+
+    asyncio.run(run())
 
     assert calls.count("delete") == 1
     assert calls.count("taem-start") == 2
@@ -361,7 +372,9 @@ def test_auto_replacement_retries_when_mother_admin_has_running_job(monkeypatch)
     assert calls.count("import") == 1
     assert operation.status == "done"
     assert operation.replacement_email == "busy-new@code2alita.com"
-    assert "继续重试" in "\n".join(operation.logs)
+    logs = "\n".join(operation.logs)
+    assert "重新排队" in logs
+    assert "继续母号补号流程" in logs
 
 
 def test_auto_replacement_retries_cookie_import_after_transient_error(monkeypatch):
