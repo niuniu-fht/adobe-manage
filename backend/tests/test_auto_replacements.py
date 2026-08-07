@@ -3,8 +3,8 @@ from contextlib import suppress
 
 from app.auto_replacements import AutoReplacementOperation, AutoReplacementService
 from app.polling import FleetPoller
-from app.remote import RemoteResponse, remote_client
-from app.taem import taem_client
+from app.remote import RemoteError, RemoteResponse, remote_client
+from app.taem import TaemError, taem_client
 
 
 def test_auto_replacement_deletes_local_before_one_shot_domain_job(
@@ -113,6 +113,190 @@ def test_auto_replacement_deletes_local_before_one_shot_domain_job(
     assert operation.replacement_email == "new@code2alita.com"
     assert secret not in str(operation.snapshot())
     assert "new@code2alita.com" in service._zero_credit_guards()
+
+
+
+def test_auto_replacement_retries_when_mother_admin_has_running_job(monkeypatch):
+    service = AutoReplacementService()
+    operation = AutoReplacementOperation(
+        instance_id="east",
+        instance_name="East",
+        base_url="https://east.example",
+        profile_id="profile-old",
+        source_email="busy@example.com",
+        trigger="凭证异常",
+        credits_available=None,
+        health="credential_error",
+        credit_threshold=0,
+    )
+    calls: list[str] = []
+    secret = "BUSY_RETRY_COOKIE"
+
+    async def fake_accounts(_base_url, _threshold):
+        return {
+            "items": [
+                {
+                    "id": "profile-old",
+                    "email": "busy@example.com",
+                    "enabled": True,
+                    "health": "credential_error",
+                    "credits_available": None,
+                }
+            ]
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        if path.endswith("delete-batch"):
+            calls.append("delete")
+            return RemoteResponse(
+                200,
+                {"status": "ok", "deleted_count": 1, "deleted_ids": ["profile-old"]},
+                {},
+            )
+        calls.append("import")
+        return RemoteResponse(
+            200,
+            {"status": "ok", "imported_count": 1, "refresh_failed_count": 0},
+            {},
+        )
+
+    async def fake_start(email, **kwargs):
+        calls.append("taem-start")
+        assert email == "busy@example.com"
+        if calls.count("taem-start") == 1:
+            raise TaemError("该母号已有拉号任务 #3 运行中", status_code=409)
+        return {"id": 74, "status": "running"}
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        calls.append("taem-job")
+        assert job_id == 74
+        return {
+            "id": 74,
+            "status": "done",
+            "log_total": 0,
+            "logs": [],
+            "result": {
+                "replacement": {"email": "busy-new@code2alita.com", "cookie": secret}
+            },
+        }
+
+    async def fake_sleep(_seconds):
+        calls.append("sleep")
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_replace_member_domain", fake_start)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr("app.auto_replacements.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {
+            "credit_threshold": 0.0,
+            "refresh_interval_minutes": 5,
+            "enabled": True,
+            "refill_mode": "registered_reuse",
+            "concurrency": 3,
+        },
+    )
+
+    asyncio.run(service._process(operation))
+
+    assert calls.count("delete") == 1
+    assert calls.count("taem-start") == 2
+    assert calls.count("taem-job") == 1
+    assert calls.count("import") == 1
+    assert operation.status == "done"
+    assert operation.replacement_email == "busy-new@code2alita.com"
+    assert "继续重试" in "\n".join(operation.logs)
+
+
+def test_auto_replacement_retries_cookie_import_after_transient_error(monkeypatch):
+    service = AutoReplacementService()
+    operation = AutoReplacementOperation(
+        instance_id="east",
+        instance_name="East",
+        base_url="https://east.example",
+        profile_id="profile-old",
+        source_email="import@example.com",
+        trigger="凭证异常",
+        credits_available=None,
+        health="credential_error",
+        credit_threshold=0,
+    )
+    calls: list[str] = []
+
+    async def fake_accounts(_base_url, _threshold):
+        return {
+            "items": [
+                {
+                    "id": "profile-old",
+                    "email": "import@example.com",
+                    "enabled": True,
+                    "health": "credential_error",
+                }
+            ]
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        if path.endswith("delete-batch"):
+            calls.append("delete")
+            return RemoteResponse(
+                200,
+                {"status": "ok", "deleted_count": 1, "deleted_ids": ["profile-old"]},
+                {},
+            )
+        calls.append("import")
+        if calls.count("import") == 1:
+            raise RemoteError("instance busy", status_code=502)
+        return RemoteResponse(
+            200,
+            {"status": "ok", "imported_count": 1, "refresh_failed_count": 0},
+            {},
+        )
+
+    async def fake_start(email, **kwargs):
+        calls.append("taem-start")
+        return {"id": 75, "status": "running"}
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        calls.append("taem-job")
+        return {
+            "id": 75,
+            "status": "done",
+            "log_total": 0,
+            "logs": [],
+            "result": {
+                "replacement": {
+                    "email": "import-new@code2alita.com",
+                    "cookie": "IMPORT_COOKIE",
+                }
+            },
+        }
+
+    async def fake_sleep(_seconds):
+        calls.append("sleep")
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_replace_member_domain", fake_start)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr("app.auto_replacements.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {
+            "credit_threshold": 0.0,
+            "refresh_interval_minutes": 5,
+            "enabled": True,
+            "refill_mode": "new_domain",
+            "concurrency": 3,
+        },
+    )
+
+    asyncio.run(service._process(operation))
+
+    assert calls.count("import") == 2
+    assert operation.status == "done"
+    assert "继续重试回写" in "\n".join(operation.logs)
 
 
 def test_scheduled_credit_refresh_obeys_interval_and_force(monkeypatch):

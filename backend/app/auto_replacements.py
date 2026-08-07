@@ -19,6 +19,9 @@ from .taem import TaemError, taem_client
 AUTO_TERMINAL_STATUSES = {"done", "partial", "failed", "skipped"}
 SOURCE_REPLACEMENT_CACHE_SECONDS = 1800
 FAILED_RETRY_COOLDOWN_SECONDS = 300
+MOTHER_RETRY_SECONDS = 12
+IMPORT_RETRY_SECONDS = 5
+IMPORT_RETRY_ATTEMPTS = 5
 
 
 @dataclass
@@ -402,7 +405,7 @@ class AutoReplacementService:
                 else {}
             )
         except (TaemError, TypeError, ValueError, RuntimeError) as exc:
-            self._fail(operation, f"启动母号域名补号失败:{exc}")
+            self._fail(operation, f"母号补号持续重试后仍未完成:{exc}")
             return
         if mother_result.get("shared"):
             operation.add_log(
@@ -431,42 +434,58 @@ class AutoReplacementService:
         operation.phase = "importing"
         operation.replacement_email = replacement_email
         operation.add_log(f"域名子号 {replacement_email or '-'} 已生成，回写实例")
-        try:
-            response = await remote_client.request(
-                operation.base_url,
-                "POST",
-                "/api/v1/refresh-profiles/import-cookie-batch",
-                json={
-                    "items": [
-                        {
-                            "cookie": {"cookie": cookie},
-                            "name": replacement_email or operation.source_email,
-                        }
-                    ]
-                },
-                timeout=600,
-            )
-        except RemoteError as exc:
-            self._fail(operation, f"新 Cookie 回写实例失败:{exc}")
-            return
-        import_data = response.data if isinstance(response.data, dict) else {}
-        try:
-            imported_count = int(import_data.get("imported_count") or 0)
-            refresh_failed = int(import_data.get("refresh_failed_count") or 0)
-        except (TypeError, ValueError):
-            imported_count = 0
-            refresh_failed = 0
+        imported_count = 0
+        refresh_failed = 0
+        import_error = ""
+        for attempt in range(1, IMPORT_RETRY_ATTEMPTS + 1):
+            try:
+                response = await remote_client.request(
+                    operation.base_url,
+                    "POST",
+                    "/api/v1/refresh-profiles/import-cookie-batch",
+                    json={
+                        "items": [
+                            {
+                                "cookie": {"cookie": cookie},
+                                "name": replacement_email or operation.source_email,
+                            }
+                        ]
+                    },
+                    timeout=600,
+                )
+                import_data = response.data if isinstance(response.data, dict) else {}
+                try:
+                    imported_count = int(import_data.get("imported_count") or 0)
+                    refresh_failed = int(import_data.get("refresh_failed_count") or 0)
+                except (TypeError, ValueError):
+                    imported_count = 0
+                    refresh_failed = 0
+                if imported_count >= 1:
+                    break
+                failed = (
+                    import_data.get("failed")
+                    if isinstance(import_data.get("failed"), list)
+                    else []
+                )
+                detail = next(
+                    (
+                        str(item.get("detail") or "")
+                        for item in failed
+                        if isinstance(item, dict) and item.get("detail")
+                    ),
+                    "实例未确认导入结果",
+                )
+                import_error = f"新 Cookie 回写实例失败:{detail}"
+            except RemoteError as exc:
+                import_error = f"新 Cookie 回写实例失败:{exc}"
+            if attempt < IMPORT_RETRY_ATTEMPTS:
+                operation.add_log(
+                    f"{import_error}，{IMPORT_RETRY_SECONDS} 秒后继续重试回写"
+                    f"({attempt}/{IMPORT_RETRY_ATTEMPTS})"
+                )
+                await asyncio.sleep(IMPORT_RETRY_SECONDS)
         if imported_count < 1:
-            failed = import_data.get("failed") if isinstance(import_data.get("failed"), list) else []
-            detail = next(
-                (
-                    str(item.get("detail") or "")
-                    for item in failed
-                    if isinstance(item, dict) and item.get("detail")
-                ),
-                "实例未确认导入结果",
-            )
-            self._fail(operation, f"新 Cookie 回写实例失败:{detail}")
+            self._fail(operation, import_error or "新 Cookie 回写实例失败")
             return
 
         operation.phase = "complete"
@@ -531,66 +550,115 @@ class AutoReplacementService:
         remove_only: bool,
         refill_mode: str,
     ) -> dict[str, Any]:
-        upstream = (
-            await taem_client.start_remove_member_only(operation.source_email)
-            if remove_only
-            else await taem_client.start_replace_member_domain(
-                operation.source_email,
-                source=refill_mode,
-            )
-        )
-        upstream_job_id = int(upstream.get("id"))
-        operation.add_log(f"母号任务 #{upstream_job_id} 已启动")
-        offset = 0
         deadline = time.monotonic() + settings.taem_timeout_seconds
-        upstream_result: dict[str, Any] = {}
+        label = (
+            "母号仅移除流程"
+            if remove_only
+            else ("母号已注册补号" if refill_mode == "registered_reuse" else "母号域名补号")
+        )
+        attempt = 0
+        last_error = ""
         while time.monotonic() < deadline:
+            attempt += 1
             try:
-                upstream = await taem_client.get_job(
-                    upstream_job_id,
-                    log_offset=offset,
+                upstream = (
+                    await taem_client.start_remove_member_only(operation.source_email)
+                    if remove_only
+                    else await taem_client.start_replace_member_domain(
+                        operation.source_email,
+                        source=refill_mode,
+                    )
                 )
             except TaemError as exc:
-                raise RuntimeError(f"读取母号任务失败:{exc}") from exc
-            logs = upstream.get("logs") if isinstance(upstream.get("logs"), list) else []
-            for line in logs:
-                operation.add_log(str(line))
-            offset = max(offset + len(logs), int(upstream.get("log_total") or 0))
-            upstream_status = str(upstream.get("status") or "running")
-            if upstream_status == "running":
-                await asyncio.sleep(2)
-                continue
-            if upstream_status != "done":
-                detail = str(upstream.get("error") or f"任务状态:{upstream_status}")
-                label = (
-                    "母号仅移除流程"
-                    if remove_only
-                    else ("母号已注册补号" if refill_mode == "registered_reuse" else "母号域名补号")
+                last_error = str(exc)[:240]
+                delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
+                operation.add_log(
+                    f"{label}暂未启动:{last_error}，{delay:g} 秒后继续重试"
+                    f"({attempt})"
                 )
-                raise RuntimeError(f"{label}结束:{detail}")
-            upstream_result = (
-                upstream.get("result")
-                if isinstance(upstream.get("result"), dict)
-                else {}
-            )
+                await asyncio.sleep(delay)
+                continue
+            try:
+                upstream_job_id = int(upstream.get("id"))
+            except (TypeError, ValueError):
+                last_error = f"母号服务未返回任务 ID:{upstream}"[:240]
+                delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
+                operation.add_log(f"{last_error}，{delay:g} 秒后继续重试({attempt})")
+                await asyncio.sleep(delay)
+                continue
+            operation.add_log(f"母号任务 #{upstream_job_id} 已启动")
+            offset = 0
+            upstream_result: dict[str, Any] = {}
+            restart = False
+            while time.monotonic() < deadline:
+                try:
+                    upstream = await taem_client.get_job(
+                        upstream_job_id,
+                        log_offset=offset,
+                    )
+                except TaemError as exc:
+                    last_error = f"读取母号任务失败:{exc}"[:240]
+                    delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
+                    operation.add_log(
+                        f"{last_error}，{delay:g} 秒后继续读取/重试({attempt})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logs = upstream.get("logs") if isinstance(upstream.get("logs"), list) else []
+                for line in logs:
+                    operation.add_log(str(line))
+                offset = max(offset + len(logs), int(upstream.get("log_total") or 0))
+                upstream_status = str(upstream.get("status") or "running")
+                if upstream_status == "running":
+                    await asyncio.sleep(2)
+                    continue
+                if upstream_status != "done":
+                    detail = str(upstream.get("error") or f"任务状态:{upstream_status}")[:240]
+                    last_error = f"{label}结束:{detail}"
+                    delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
+                    operation.add_log(
+                        f"{last_error}，{delay:g} 秒后重新启动母号流程({attempt})"
+                    )
+                    await asyncio.sleep(delay)
+                    restart = True
+                    break
+                upstream_result = (
+                    upstream.get("result")
+                    if isinstance(upstream.get("result"), dict)
+                    else {}
+                )
+                replacement = (
+                    upstream_result.get("replacement")
+                    if isinstance(upstream_result.get("replacement"), dict)
+                    else {}
+                )
+                replacement_cookie = str(replacement.get("cookie") or "").strip()
+                if not remove_only and not replacement_cookie:
+                    last_error = "母号任务已结束，但本次域名补号未返回 Cookie"
+                    delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
+                    operation.add_log(
+                        f"{last_error}，{delay:g} 秒后重新启动母号流程({attempt})"
+                    )
+                    await asyncio.sleep(delay)
+                    restart = True
+                    break
+                return {
+                    "upstream_job_id": upstream_job_id,
+                    "upstream_result": upstream_result,
+                    "replacement_email": str(replacement.get("email") or "").strip().lower(),
+                    "replacement_cookie": replacement_cookie,
+                }
+            if restart:
+                continue
             break
-        else:
-            raise RuntimeError(
+        raise RuntimeError(
+            last_error
+            or (
                 "母号已注册补号等待超时"
                 if refill_mode == "registered_reuse"
-                else "母号域名补号等待超时",
+                else "母号域名补号等待超时"
             )
-        replacement = (
-            upstream_result.get("replacement")
-            if isinstance(upstream_result.get("replacement"), dict)
-            else {}
         )
-        return {
-            "upstream_job_id": upstream_job_id,
-            "upstream_result": upstream_result,
-            "replacement_email": str(replacement.get("email") or "").strip().lower(),
-            "replacement_cookie": str(replacement.get("cookie") or "").strip(),
-        }
 
     @staticmethod
     def _error_trigger(item: dict[str, Any]) -> str:
