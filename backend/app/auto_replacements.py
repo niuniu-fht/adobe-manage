@@ -632,6 +632,15 @@ class AutoReplacementService:
                 if upstream_status != "done":
                     detail = str(upstream.get("error") or f"任务状态:{upstream_status}")[:240]
                     last_error = f"{label}结束:{detail}"
+                    if self._is_source_missing_error(detail):
+                        operation.add_log(f"{last_error}，母号侧已不存在该成员")
+                        return {
+                            "upstream_job_id": upstream_job_id,
+                            "upstream_result": {},
+                            "replacement_email": "",
+                            "replacement_cookie": "",
+                            "source_missing": True,
+                        }
                     delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
                     operation.add_log(
                         f"{last_error}，{delay:g} 秒后重新启动母号流程({attempt})"
@@ -651,6 +660,17 @@ class AutoReplacementService:
                 )
                 replacement_cookie = str(replacement.get("cookie") or "").strip()
                 if not remove_only and not replacement_cookie:
+                    result_error = str(upstream_result.get("error") or upstream.get("error") or "")
+                    if self._is_source_missing_error(result_error):
+                        last_error = result_error[:240]
+                        operation.add_log(f"母号任务未返回 Cookie:{last_error}，母号侧已不存在该成员")
+                        return {
+                            "upstream_job_id": upstream_job_id,
+                            "upstream_result": upstream_result,
+                            "replacement_email": "",
+                            "replacement_cookie": "",
+                            "source_missing": True,
+                        }
                     last_error = "母号任务已结束，但本次域名补号未返回 Cookie"
                     delay = min(MOTHER_RETRY_SECONDS, max(1.0, deadline - time.monotonic()))
                     operation.add_log(
@@ -680,7 +700,12 @@ class AutoReplacementService:
     @staticmethod
     def _is_source_missing_error(message: str) -> bool:
         text = str(message or "").strip().lower()
-        return "未找到子号" in text or "child account not found" in text
+        return (
+            "未找到子号" in text
+            or "未找到成员" in text
+            or "child account not found" in text
+            or "member not found" in text
+        )
 
 
     @staticmethod

@@ -186,6 +186,90 @@ def test_auto_replacement_completes_when_mother_child_is_missing(monkeypatch):
     assert "直接结束" in "\n".join(operation.logs)
 
 
+
+def test_auto_replacement_completes_when_mother_member_is_missing_in_job(monkeypatch):
+    service = AutoReplacementService()
+    operation = AutoReplacementOperation(
+        instance_id="east",
+        instance_name="East",
+        base_url="https://east.example",
+        profile_id="profile-old",
+        source_email="missing-member@example.com",
+        trigger="凭证异常",
+        credits_available=None,
+        health="credential_error",
+        credit_threshold=0,
+    )
+    calls: list[str] = []
+
+    async def fake_accounts(_base_url, _threshold):
+        return {
+            "items": [
+                {
+                    "id": "profile-old",
+                    "email": "missing-member@example.com",
+                    "enabled": True,
+                    "health": "credential_error",
+                }
+            ]
+        }
+
+    async def fake_request(_base_url, _method, path, **kwargs):
+        if path.endswith("delete-batch"):
+            calls.append("delete")
+            return RemoteResponse(
+                200,
+                {"status": "ok", "deleted_count": 1, "deleted_ids": ["profile-old"]},
+                {},
+            )
+        calls.append("import")
+        raise AssertionError("missing member should not import a replacement cookie")
+
+    async def fake_start(email, **kwargs):
+        calls.append("taem-start")
+        return {"id": 76, "status": "running"}
+
+    async def fake_get_job(job_id, *, log_offset=0):
+        calls.append("taem-job")
+        return {
+            "id": 76,
+            "status": "failed",
+            "log_total": 2,
+            "logs": [
+                "开始移除子号 [missing-member@example.com] …",
+                "✗ [missing-member@example.com] 移除失败:未找到成员:missing-member@example.com",
+            ],
+            "error": "未找到成员:missing-member@example.com",
+        }
+
+    async def fake_sleep(_seconds):
+        calls.append("sleep")
+
+    monkeypatch.setattr(remote_client, "accounts", fake_accounts)
+    monkeypatch.setattr(remote_client, "request", fake_request)
+    monkeypatch.setattr(taem_client, "start_replace_member_domain", fake_start)
+    monkeypatch.setattr(taem_client, "get_job", fake_get_job)
+    monkeypatch.setattr("app.auto_replacements.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "app.auto_replacements.get_auto_replacement_settings",
+        lambda _db: {
+            "credit_threshold": 0.0,
+            "refresh_interval_minutes": 5,
+            "enabled": True,
+            "refill_mode": "registered_reuse",
+            "concurrency": 3,
+        },
+    )
+
+    asyncio.run(service._process(operation))
+
+    assert calls == ["delete", "taem-start", "taem-job"]
+    assert operation.status == "done"
+    assert operation.phase == "complete"
+    assert operation.remove_only is True
+    assert "直接结束" in "\n".join(operation.logs)
+
+
 def test_auto_replacement_retries_when_mother_admin_has_running_job(monkeypatch):
     service = AutoReplacementService()
     operation = AutoReplacementOperation(
